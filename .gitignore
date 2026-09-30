@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+.venv/
+venv/
+tests/test_data/generated/
+benchmark/results/
+.vscode/
+.idea/
+
+# 运行期临时产物(截图/网格图/调试图/定位日志/锚点)
+runner/tmp/
+runner/device_id.txt
+
+# 本地冒烟测试脚本
+_smoke_test.py

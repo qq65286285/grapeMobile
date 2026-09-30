@@ -1,0 +1,20 @@
+[
+  {
+    "type": "tap",
+    "cell": "F11",
+    "delay_before": 0.0,
+    "wait_after": 30.0
+  },
+  {
+    "type": "tap",
+    "cell": "U9",
+    "delay_before": 0.0,
+    "wait_after": 20.0
+  },
+  {
+    "type": "tap",
+    "cell": "L37",
+    "delay_before": 0.0,
+    "wait_after": 10.0
+  }
+]

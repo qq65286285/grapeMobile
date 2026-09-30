@@ -1,0 +1,10 @@
+# 可选依赖：深度学习兜底层（LightGlue），仅在需要"高级模式"时安装
+# 安装方式：pip install -r requirements-optional.txt
+# 或者：pip install imgloc[deep]
+#
+# 注意：未安装本文件依赖时，imgloc 会自动跳过深度学习匹配层，
+# 不影响模板匹配/形状匹配/特征点匹配三层的正常使用。
+torch>=2.0.0
+torchvision>=0.15.0
+kornia>=0.7.0
+lightglue @ git+https://github.com/cvg/LightGlue.git

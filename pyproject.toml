@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imgloc"
+version = "0.1.0"
+description = "App自动化测试图像定位核心库：多算法路由的模板/形状/特征点/深度学习图像匹配引擎"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "GrapeMobile Team" }]
+keywords = ["image-matching", "template-matching", "feature-matching", "app-automation", "computer-vision"]
+
+# 核心依赖：仅 opencv-python + numpy，保证库轻量、零设备依赖
+dependencies = [
+    "opencv-python>=4.8.0,<5.0.0",
+    "numpy>=1.24.0,<2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# 深度学习兜底层（LightGlue）依赖，按需安装：pip install imgloc[deep]
+deep = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "kornia>=0.7.0",
+    "lightglue @ git+https://github.com/cvg/LightGlue.git",
+]
+# 开发/测试依赖：pip install imgloc[dev]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "tabulate>=0.9.0",
+]
+# 一次性安装全部（深度学习+开发工具）
+all = ["imgloc[deep,dev]"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

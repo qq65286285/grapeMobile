@@ -1,0 +1,26 @@
+[
+  {
+    "type": "tap",
+    "cell": "G11",
+    "delay_before": 0.0,
+    "wait_after": 60.0,
+    "before_image": "images/before_0001.png",
+    "after_image": ""
+  },
+  {
+    "type": "tap",
+    "cell": "T9",
+    "delay_before": 0.0,
+    "wait_after": 60.0,
+    "before_image": "images/before_0002.png",
+    "after_image": ""
+  },
+  {
+    "type": "tap",
+    "cell": "L37",
+    "delay_before": 0.0,
+    "wait_after": 60.0,
+    "before_image": "images/before_0003.png",
+    "after_image": ""
+  }
+]

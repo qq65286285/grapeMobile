@@ -1,0 +1,10 @@
+# GrapeMobile 依赖
+opencv-python
+numpy
+pyyaml
+
+# OCR 定位(src/locate/ocr.py)
+rapidocr-onnxruntime
+rapidfuzz
+
+# AI 客户端(aiclient.py 仅用标准库 urllib,无额外依赖)

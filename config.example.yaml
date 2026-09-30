@@ -1,0 +1,55 @@
+# imgloc 配置文件示例
+# 用法: Locator(strategy="auto", config="config.example.yaml")
+# 只需覆盖你关心的字段，未列出的字段会自动使用内置默认值（见 src/imgloc/config.py）
+
+router:
+  # 责任链尝试顺序，可自由增删/调整。例如不想用形状匹配和深度学习层，可写：
+  # order: [template, orb, sift]
+  order: [template, shape, orb, sift, lightglue]
+  # 全局默认阈值（各层配置中的 threshold 优先级更高，会覆盖此项）
+  default_threshold: 0.8
+  # 某层异常/依赖缺失时是否静默跳过（推荐保持 true，保证责任链健壮性）
+  skip_on_error: true
+
+template:
+  threshold: 0.85
+  method: TM_CCOEFF_NORMED   # TM_CCOEFF_NORMED / TM_CCORR_NORMED / TM_SQDIFF_NORMED
+  scale_range: [0.5, 1.5]    # 多尺度金字塔遍历范围
+  scale_step: 0.05
+  use_color: true            # true=RGB三通道加权匹配，false=转灰度匹配(更快)
+  channel_weights: [0.34, 0.33, 0.33]
+  rotation_invariant: false  # 是否开启旋转不变匹配（会显著增加耗时）
+  rotation_range: [-15, 15]
+  rotation_step: 5
+
+shape:
+  threshold: 0.75
+  canny_low: 50
+  canny_high: 150
+  scale_range: [0.8, 1.2]
+  scale_step: 0.1
+  angle_range: [-10, 10]
+  angle_step: 5
+
+orb:
+  threshold: 0.35
+  n_features: 500
+  matcher_type: bf           # bf / flann
+  min_match_count: 8
+  ransac_reproj_threshold: 5.0
+  knn_ratio: 0.75
+
+sift:
+  threshold: 0.35
+  n_features: 0              # 0 表示不限制
+  matcher_type: flann
+  min_match_count: 8
+  ransac_reproj_threshold: 5.0
+  knn_ratio: 0.75
+
+lightglue:
+  threshold: 0.3
+  device: auto               # auto / cpu / cuda
+  extractor: superpoint      # superpoint / disk / aliked
+  max_keypoints: 1024
+  min_match_count: 6
