@@ -22,13 +22,23 @@ def _solid_image(color, shape=(120, 160, 3)):
 
 class TestValidateSteps:
     def test_tap_defaults_fill_zero(self):
-        """未写字段时间字段默认补 0,标准图默认空串。"""
+        """未写字段时间字段默认补 0,标准图默认空串,desc 默认空串。"""
         steps = validate_steps([{"type": "tap", "cell": "u18"}])
         assert steps == [
             {"type": "tap", "cell": "U18", "x": None, "y": None,
              "delay_before": 0.0,
-             "wait_after": 0.0, "before_image": "", "after_image": ""}
+             "wait_after": 0.0, "before_image": "", "after_image": "",
+             "desc": ""}
         ]
+
+    def test_desc_kept_and_defaulted(self):
+        """desc 人类可读描述(GUI AI 模式附带):提供则保留,未提供补空串。"""
+        steps = validate_steps([
+            {"type": "tap", "cell": "A1", "desc": " 点击登录 "},
+            {"type": "tap", "cell": "B2"},
+        ])
+        assert steps[0]["desc"] == "点击登录"
+        assert steps[1]["desc"] == ""
 
     def test_tap_with_waits(self):
         steps = validate_steps([
@@ -96,7 +106,8 @@ class TestSaveLoadSteps:
         assert loaded == [
             {"type": "tap", "cell": "A3", "x": None, "y": None,
              "delay_before": 0.0,
-             "wait_after": 5.0, "before_image": "", "after_image": ""}
+             "wait_after": 5.0, "before_image": "", "after_image": "",
+             "desc": ""}
         ]
 
     def test_pixel_coords_kept(self):

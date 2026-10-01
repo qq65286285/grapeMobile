@@ -18,6 +18,8 @@ benchmark/results/
 # 运行期临时产物(截图/网格图/调试图/定位日志/锚点)
 runner/tmp/
 runner/device_id.txt
+# GUI 未保存草稿(运行时数据)
+runner/scripts/untitled/
 
 # 本地冒烟测试脚本
 _smoke_test.py

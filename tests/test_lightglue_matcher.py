@@ -21,18 +21,26 @@ class TestLightGlueAvailability:
 
 
 class TestLightGlueGracefulDegradation:
-    def test_match_returns_not_found_when_deps_missing(self):
+    def test_match_returns_not_found_when_deps_missing(self, monkeypatch):
         """
-        即使依赖缺失，调用 match()（而非 _match()）也不应抛出异常，
-        因为基类 Matcher.match() 会捕获内部异常并转换为 not_found 结果，
+        依赖缺失时调用 match()（而非 _match()）不应抛出异常:
+        基类 Matcher.match() 会捕获 MatcherNotAvailableError 并转换为 not_found 结果,
         这正是 MultiStrategyLocator 能安全跳过本层的关键保障。
+
+        用 monkeypatch 强制模拟"依赖未安装"环境,使本测试在任何机器上都
+        不真实初始化模型(避免 torch.hub 联网下载 SuperPoint 权重导致卡死),
+        也不依赖本机是否安装了 imgloc[deep]。
         """
+        import imgloc.matchers.lightglue_matcher as lg_mod
+
+        monkeypatch.setattr(lg_mod, "_check_deps_available", lambda: False)
+
         matcher = LightGlueMatcher()
+        assert matcher.is_available() is False
         scene = np.zeros((100, 100, 3), dtype=np.uint8)
         template = np.zeros((20, 20, 3), dtype=np.uint8)
         result = matcher.match(scene, template, threshold=0.3)
 
-        if not matcher.is_available():
-            assert result.found is False
-            assert result.method_used == "lightglue"
-            assert "error" in result.extra or "error_type" in result.extra
+        assert result.found is False
+        assert result.method_used == "lightglue"
+        assert "error" in result.extra or "error_type" in result.extra

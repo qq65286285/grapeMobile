@@ -120,6 +120,50 @@ class AdbClient:
         logger.info("[AdbClient] 设备已连接: %s", device_id)
         return True
 
+    def list_devices(self, timeout: float = 10.0) -> List[tuple]:
+        """
+        枚举当前 adb 可见的设备:adb devices。
+
+        Returns:
+            [(serial, state), ...] 列表,保持 adb 输出顺序。state 常见取值:
+                - "device":       在线可用
+                - "offline":      离线
+                - "unauthorized": 未授权(手机上未点"允许 USB 调试")
+                - "recovery":     恢复模式
+            无设备时返回空列表 []。
+
+        Raises:
+            AdbError: adb 不可执行 / 命令超时 / 返回非零。
+        """
+        logger.info("[AdbClient] 枚举设备: adb devices")
+        result = self._run_raw(["devices"], timeout=timeout)
+        return self.parse_devices_output(result.stdout or "")
+
+    @staticmethod
+    def parse_devices_output(output: str) -> List[tuple]:
+        """
+        解析 `adb devices` 文本输出为 [(serial, state), ...]。
+
+        典型输出:
+            List of devices attached
+            emulator-5554   device
+            192.168.1.10:5555       offline
+            ABC123XYZ       unauthorized
+
+        防御:跳过标题行/空行/以 '*' 开头的 daemon 提示行;每行按空白拆分,
+        取前两段(serial, state),其余描述信息(如 usb:xxx product:xxx)忽略。
+        """
+        devices: List[tuple] = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("*") or line.lower().startswith("list of devices"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            devices.append((parts[0], parts[1]))
+        return devices
+
     def attach(self, device_id: str, timeout: float = 5.0) -> bool:
         """
         挂载直连设备(模拟器 / USB):不执行 adb connect,校验在线后记录 device_id。

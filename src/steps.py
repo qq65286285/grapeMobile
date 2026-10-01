@@ -10,6 +10,7 @@ src/steps.py - 步骤编排执行引擎
     [
         {
             "type": "tap", "cell": "U18",
+            "desc": "点击登录按钮",  # 可选人类可读描述(GUI AI 模式附带),省略则为空
             "delay_before": 0,    # 执行前等待秒数(默认 0)
             "wait_after": 10,     # 点击后等待秒数/画面等待超时上限(默认 0)
             "expect_image": "images/0002.png"
@@ -142,6 +143,8 @@ def validate_steps(steps: Any) -> List[Step]:
             if not before_image:
                 before_image = _img_field("expect_image")
             after_image = _img_field("after_image")
+            # 可选人类可读描述(GUI AI 模式保存步骤时附带的用户指令文本)
+            desc = step.get("desc")
             normalized.append({
                 "type": "tap",
                 "cell": cell,
@@ -151,6 +154,7 @@ def validate_steps(steps: Any) -> List[Step]:
                 "wait_after": _parse_seconds(step.get("wait_after", 0), "wait_after", i),
                 "before_image": before_image,
                 "after_image": after_image,
+                "desc": "" if desc is None else str(desc).strip(),
             })
         else:
             raise StepError(f"第 {i} 步类型未知: {stype!r}(支持 tap)")

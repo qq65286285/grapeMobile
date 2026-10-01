@@ -19,16 +19,22 @@ runner/gui_steps.py - 步骤编排可视化界面(Tkinter)
     runner/scripts/进入游戏/images/0001.png
 未保存的新脚本先录制到 scripts/untitled/images/,"保存"时随脚本名整体迁移。
 
-运行前提:runner/device_id.txt 存在(python runner/capture.py 已跑过一次)。
+启动时自动执行 adb devices 弹出设备选择框:
+    - 必须选择一台"在线"设备才能进入主界面(空列表/离线/未授权均不可进入),
+      弹框内置"⟳ 刷新"按钮,可在连接设备/授权后重新检测;
+    - 选中的设备 id 会写入 runner/device_id.txt(与 capture.py 产物布局一致,
+      StepRunner / grid.py / main.py 可直接复用),无需先手动运行 capture.py。
 启动:python runner/gui_steps.py
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
@@ -66,6 +72,262 @@ EXPECT_IMG_W = 168
 EXPECT_IMG_H = 150
 
 
+class _UiBridge:
+    """
+    后台线程 -> 主线程的安全投递桥梁。
+
+    背景:直接在后台线程里调用 widget.after()/任何 Tk 方法,
+    一旦此刻主循环未运行(窗口关闭流程中 Tcl 解释器已销毁),
+    _tkinter 会抛出 RuntimeError: main thread is not in main loop,
+    且该跨线程 Tcl 调用可能卡住解释器退出,表现为"程序关不掉"。
+
+    规则:
+        - 后台线程只调用 post(fn),把可调用对象放进 queue(不触碰 Tk);
+        - 主线程通过 after 定时器轮询队列并执行回调,所有 Tk 操作都在主线程;
+        - close() 后停止轮询并丢弃后续回调,关闭路径完全闭环。
+    """
+
+    def __init__(self, widget: tk.Misc, interval_ms: int = 60) -> None:
+        self._widget = widget
+        self._q: "queue.Queue[Any]" = queue.Queue()
+        self._closed = False
+        self._interval = interval_ms
+        # 轮询定时器本身只在主线程创建/续期
+        widget.after(interval_ms, self._pump)
+
+    def post(self, fn) -> None:
+        """后台线程调用:把回调投递到主线程执行。关闭后直接丢弃。"""
+        if not self._closed:
+            self._q.put(fn)
+
+    def _pump(self) -> None:
+        if self._closed:
+            return
+        try:
+            while True:
+                cb = self._q.get_nowait()
+                try:
+                    cb()
+                except tk.TclError:
+                    # 回调执行期间对应组件恰好被销毁,忽略即可
+                    pass
+        except queue.Empty:
+            pass
+        if self._closed:
+            return
+        try:
+            self._widget.after(self._interval, self._pump)
+        except (RuntimeError, tk.TclError):
+            # 窗口/解释器已销毁,停止轮询
+            self._closed = True
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class DeviceSelectDialog(tk.Toplevel):
+    """
+    启动时的模态设备选择框:枚举 adb devices,用户必须选中一台在线设备才能进入。
+
+    交互规则:
+        - 打开即自动检测一次;"⟳ 刷新"在后台线程重跑 adb devices(不卡 UI);
+        - state == "device"(在线)的行可选,双击等价"确定";
+        - offline/unauthorized 等状态灰显且不可选(但仍展示,避免用户误以为没检测到);
+        - 列表为空 / adb 不可用:无法确定,停留在本框靠刷新重试;
+        - 关闭窗口或点"取消":selected=None,主程序直接退出(不允许进入主界面)。
+
+    用法:
+        >>> dlg = DeviceSelectDialog(root)
+        >>> root.wait_window(dlg)
+        >>> device_id = dlg.selected   # None 表示用户放弃
+    """
+
+    # adb 设备状态 -> 中文展示
+    STATE_LABELS = {
+        "device": "在线",
+        "offline": "离线",
+        "unauthorized": "未授权(请在手机上点\"允许 USB 调试\")",
+        "recovery": "恢复模式",
+        "no device": "无设备",
+    }
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.title("选择设备")
+        self.resizable(False, False)
+        self.selected: Optional[str] = None
+        self._busy = False
+        # 后台线程经 bridge 回主线程;对话框销毁时 close,杜绝跨线程 Tk 调用
+        self._bridge = _UiBridge(self)
+        self._build_ui()
+        # 注意:不能调用 self.transient(parent) —— 主窗口(parent)此刻处于 withdrawn
+        # 状态,Windows 下 transient 子窗口会被连带强制 withdrawn,表现为窗口完全
+        # 不显示、进程却在跑。不设 transient 时对话框独立映射,并在任务栏有入口。
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.geometry("560x330")
+        self._center_on_screen()
+        self._bring_to_front()
+        self.grab_set()
+        # 进入即自动检测一次
+        self.after(50, self._refresh_devices)
+
+    def _center_on_screen(self) -> None:
+        """把对话框居中到屏幕。"""
+        self.update_idletasks()
+        w, h = 560, 330
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def _bring_to_front(self) -> None:
+        """确保对话框显示在终端等其他窗口之上并拿到键盘焦点。"""
+        self.deiconify()
+        self.lift()
+        try:
+            # 短暂置顶抢焦点,300ms 后解除,避免一直压住其他窗口
+            self.attributes("-topmost", True)
+            self.after(300, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+        self.focus_force()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        frm = ttk.Frame(self, padding=12)
+        frm.grid(sticky="nsew")
+
+        ttk.Label(frm, text="请选择要连接的 adb 设备(仅\"在线\"设备可进入):").grid(
+            row=0, column=0, columnspan=3, sticky="w")
+
+        self.tree = ttk.Treeview(frm, columns=("serial", "state"),
+                                 show="headings", height=8, selectmode="browse")
+        self.tree.heading("serial", text="设备序列号")
+        self.tree.heading("state", text="状态")
+        self.tree.column("serial", width=300, anchor="w")
+        self.tree.column("state", width=220, anchor="w")
+        self.tree.grid(row=1, column=0, columnspan=3, pady=8, sticky="ew")
+        self.tree.tag_configure("unavailable", foreground="#999")
+        self.tree.bind("<Double-1>", lambda e: self._confirm())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._sync_ok_state())
+
+        self.status_var = tk.StringVar(value="正在检测设备…")
+        ttk.Label(frm, textvariable=self.status_var, foreground="#b00",
+                  wraplength=530, justify="left").grid(
+            row=2, column=0, columnspan=3, sticky="w")
+
+        self.refresh_btn = ttk.Button(frm, text="⟳ 刷新", command=self._refresh_devices)
+        self.refresh_btn.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.ok_btn = ttk.Button(frm, text="确定", command=self._confirm, state="disabled")
+        self.ok_btn.grid(row=3, column=1, sticky="e", padx=(8, 4), pady=(10, 0))
+        self.cancel_btn = ttk.Button(frm, text="取消", command=self._cancel)
+        self.cancel_btn.grid(row=3, column=2, sticky="e", pady=(10, 0))
+        frm.columnconfigure(0, weight=1)
+
+    # ------------------------------------------------------------------
+    # 设备枚举(后台线程)
+    # ------------------------------------------------------------------
+    def _refresh_devices(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.refresh_btn.configure(state="disabled")
+        self.ok_btn.configure(state="disabled")
+        self.status_var.set("正在执行 adb devices 检测设备…")
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    def _refresh_worker(self) -> None:
+        """后台线程执行 adb devices,结果经队列回主线程渲染(不触碰 Tk)。"""
+        error, devices = None, []
+        try:
+            devices = AdbClient().list_devices()
+        except Exception as exc:  # adb 未找到/超时/返回非零,均允许刷新重试
+            error = exc
+        # 窗口可能已在此期间被关闭:bridge 关闭后投递被直接丢弃
+        self._bridge.post(lambda: self._refresh_done(error, devices))
+
+    def _refresh_done(self, error, devices) -> None:
+        self._busy = False
+        if not self.winfo_exists():
+            return
+        self.refresh_btn.configure(state="normal")
+
+        if error is not None:
+            self.status_var.set(
+                f"设备检测失败: {error}\n请确认 adb 已安装并加入 PATH,然后点「⟳ 刷新」重试。")
+            return
+
+        online_serials = []
+        for serial, state in devices:
+            available = state == "device"
+            tags = () if available else ("unavailable",)
+            self.tree.insert(
+                "", "end", iid=serial,
+                values=(serial, self.STATE_LABELS.get(state, state)),
+                tags=tags,
+            )
+            if available:
+                online_serials.append(serial)
+
+        if online_serials:
+            self.status_var.set(
+                f"共 {len(devices)} 台设备,其中 {len(online_serials)} 台在线。"
+                "双击设备或选中后点「确定」。")
+            # 只有一台在线设备时自动选中,省一次点击
+            if len(online_serials) == 1:
+                self.tree.selection_set(online_serials[0])
+                self.tree.focus(online_serials[0])
+        elif devices:
+            self.status_var.set(
+                "检测到设备但均不可用(离线/未授权)。请在手机上允许 USB 调试"
+                "或等待设备上线,然后点「⟳ 刷新」。")
+        else:
+            self.status_var.set(
+                "未检测到设备。请连接手机(开启 USB 调试)或启动模拟器,"
+                "然后点「⟳ 刷新」。")
+        self._sync_ok_state()
+
+    # ------------------------------------------------------------------
+    # 选择确认
+    # ------------------------------------------------------------------
+    def _selected_serial(self) -> Optional[str]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        # 灰显行(离线/未授权)即使被键盘高亮也不允许确认
+        if "unavailable" in self.tree.item(iid, "tags"):
+            return None
+        return iid
+
+    def _sync_ok_state(self) -> None:
+        state = "normal" if self._selected_serial() else "disabled"
+        self.ok_btn.configure(state=state)
+
+    def _confirm(self) -> None:
+        serial = self._selected_serial()
+        if not serial:
+            return
+        self.selected = serial
+        self._teardown()
+
+    def _cancel(self) -> None:
+        self.selected = None
+        self._teardown()
+
+    def _teardown(self) -> None:
+        """关闭对话框的唯一出口:停轮询、释放模态抓取、销毁。"""
+        self._bridge.close()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+
 class StepApp(tk.Tk):
     """步骤编排主窗口:网格图选格 + 步骤列表 + 执行控制。"""
 
@@ -73,6 +335,12 @@ class StepApp(tk.Tk):
         super().__init__()
         self.title("GrapeMobile 步骤编排器")
         self.resizable(False, False)
+        # 主窗口在设备选择/首次截图完成前保持隐藏,避免弹出主窗口后又因失败退出
+        self.withdraw()
+        self._startup_ok = False
+        # 所有后台线程经此桥接回主线程,禁止子线程直接调用 after()/触碰组件
+        self._bridge = _UiBridge(self)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.steps: List[Dict[str, Any]] = []
         self._running = False
@@ -92,29 +360,54 @@ class StepApp(tk.Tk):
         self._ai_overlay_active = False  # 画布正显示候选框(屏蔽普通点格录入)
         self._ai_adjusted = False     # 当前候选被用户手动微调过
         self._ai_drag_last = None     # 拖动微调上一次位置
+        self._ai_instruction = ""     # 当前指令文本(确认后随步骤保存为 desc)
 
-        # ---- 加载网格:优先连接设备实时截图,失败时回退到静态网格图文件 ----
+        # ---- 启动闸门 1:弹窗枚举 adb devices,必须选中一台在线设备 ----
+        dlg = DeviceSelectDialog(self)
+        self.wait_window(dlg)
+        device_id = dlg.selected
+        if not device_id:
+            # 用户取消/关窗:无设备不允许进入,直接退出
+            self._quit_startup()
+            return
+        self.device_id = device_id
+        # 写 device_id.txt:与 capture.py 产物布局一致,
+        # StepRunner.from_capture_artifacts / grid.py / main.py 可直接复用
+        try:
+            with open(DEVICE_ID_FILE, "w", encoding="utf-8") as f:
+                f.write(device_id)
+        except OSError as exc:
+            messagebox.showerror("初始化失败", f"写入 device_id.txt 失败: {exc}")
+            self._quit_startup()
+            return
+
+        # ---- 启动闸门 2:连设备实时截图生成网格;失败则提示并退出,不再静默回退静态图 ----
         self._startup_msg = ""
         try:
             self._capture_from_device()
             self._startup_msg = f"已连接设备 {self.device_id},当前为实时截图"
         except Exception as exc:
-            if not self._load_from_file():
-                messagebox.showerror(
-                    "加载失败",
-                    f"设备实时截图失败: {exc}\n\n且未找到静态网格图,请先运行:\n"
-                    "python runner/capture.py",
-                )
-                self.destroy()
-                return
-            self._startup_msg = f"设备不可用({exc}),已回退到静态网格图 grid_screenshot.png"
+            messagebox.showerror(
+                "设备截图失败",
+                f"连接设备 {device_id} 或截图失败:\n{exc}\n\n"
+                "请确认设备在线且 USB 调试可用,然后重新启动本程序。",
+            )
+            self._quit_startup()
+            return
 
+        self.deiconify()
+        self.lift()
+        self.focus_force()
         self._build_ui()
+        self._startup_ok = True
         self._log(self._startup_msg)
+        # 默认打开 AI 模式 Tab(用户主要工作区)
+        self.notebook.select(1)
         # AI 模式欢迎语
         self._ai_chat_append("AI", "你好!我是 AI 步骤编排助手。\n"
-                            "描述你想点击的元素,我会帮你找到对应的格子。\n"
-                            "例如:点击kof图标、点击登录按钮")
+                            "输入你想做的操作(如:点击kof图标),我定位后\n"
+                            "点「✓ 保存为步骤」即可存入脚本步骤。\n"
+                            "也可以切换到普通模式直接点格子添加步骤。")
 
         # ---- 伪实时:每秒自动重截(后台线程生产,主线程应用) ----
         self._auto_busy = False        # 是否有截图线程在跑(防止重叠)
@@ -122,12 +415,30 @@ class StepApp(tk.Tk):
         self.after(1000, self._auto_tick)
 
     # ------------------------------------------------------------------
+    # 关闭
+    # ------------------------------------------------------------------
+    def _quit_startup(self) -> None:
+        """启动阶段(设备选择/首次截图失败或取消)退出:先断桥接再销毁。"""
+        self._bridge.close()
+        self.destroy()
+
+    def _on_close(self) -> None:
+        """主窗口关闭:停止后台->主线程投递,后台线程为 daemon,随进程退出。"""
+        self._bridge.close()
+        self.destroy()
+
+    # ------------------------------------------------------------------
     # 自动刷新(伪实时)
     # ------------------------------------------------------------------
     def _auto_tick(self) -> None:
         """每秒触发一次:条件满足时启动后台截图线程。"""
+        if not self.winfo_exists():
+            return
         if (self._auto_var.get() and not self._running
-                and not self._auto_busy and self.device_id):
+                and not self._auto_busy and self.device_id
+                # AI 定位中/候选待确认时暂停:候选坐标基于当前帧,
+                # 画面被自动刷新换掉后坐标即失效,确认按钮也会被 _set_grid 清掉
+                and not self._ai_busy and not self._ai_overlay_active):
             self._auto_busy = True
             threading.Thread(target=self._auto_worker, daemon=True).start()
         self.after(1000, self._auto_tick)
@@ -139,10 +450,7 @@ class StepApp(tk.Tk):
             payload = self._produce_grid_from_device()
         except Exception as exc:
             error = exc
-        try:
-            self.after(0, self._auto_apply, error, payload)
-        except tk.TclError:
-            pass  # 窗口已关闭
+        self._bridge.post(lambda: self._auto_apply(error, payload))
 
     def _auto_apply(self, error, payload) -> None:
         """主线程:应用自动刷新结果。"""
@@ -174,17 +482,19 @@ class StepApp(tk.Tk):
             (device_id, grid_bgr, cell_size, raw_bgr)
 
         Raises:
-            StepError / AdbError: 无设备记录、设备离线或截图失败时抛出。
+            StepError / AdbError: 未选择设备、设备离线或截图失败时抛出。
         """
-        if not os.path.isfile(DEVICE_ID_FILE):
-            raise StepError("无设备记录(device_id.txt),请先运行 capture.py")
-        with open(DEVICE_ID_FILE, "r", encoding="utf-8") as f:
-            device_id = f.read().strip()
+        device_id = self.device_id
         if not device_id:
-            raise StepError("device_id.txt 为空")
+            raise StepError("尚未选择设备,请重新启动并在设备列表中选择一台在线设备")
 
         client = AdbClient()
-        client.attach(device_id)
+        # 与 executor.AdbExecutor 一致:含 ":" 视为网络设备走 adb connect,
+        # 模拟器/USB 序列号走 attach 在线校验
+        if ":" in device_id:
+            client.connect(device_id)
+        else:
+            client.attach(device_id)
         image_path = client.screenshot()  # 保存到 runner/tmp/image/screenshot.png
         img = cv2.imread(image_path)
         if img is None:
@@ -223,25 +533,6 @@ class StepApp(tk.Tk):
             except (_json.JSONDecodeError, KeyError, ValueError):
                 pass
         return DEFAULT_CELL_SIZE
-
-    def _load_from_file(self) -> bool:
-        """回退:从静态网格图文件加载。成功返回 True。"""
-        import json as _json
-
-        if not os.path.isfile(GRID_IMAGE) or not os.path.isfile(GRID_META):
-            return False
-        try:
-            with open(GRID_META, "r", encoding="utf-8") as f:
-                cell_size = int(_json.load(f)["cell_size"])
-            grid = cv2.imread(GRID_IMAGE)
-            if grid is None:
-                return False
-        except (_json.JSONDecodeError, KeyError, ValueError):
-            return False
-        self._set_grid(grid, cell_size)
-        # 静态回退模式:从 screenshot.png 读原始画面用于录制锚点(可能与设备当前画面有延迟)
-        self._latest_raw = cv2.imread(RAW_IMAGE)
-        return True
 
     def _set_grid(self, grid_bgr, cell_size: int) -> None:
         """设置当前网格图并重算显示参数(画布存在时同步刷新)。"""
@@ -383,7 +674,7 @@ class StepApp(tk.Tk):
             row=3, column=1, sticky="w", padx=4)
 
         # 确认/否认/换候选按钮(初始隐藏,AI 提议后显示)
-        self._ai_confirm_btn = ttk.Button(ai_tab, text="✓ 是这个",
+        self._ai_confirm_btn = ttk.Button(ai_tab, text="✓ 保存为步骤",
                                          command=self._ai_confirm)
         self._ai_deny_btn = ttk.Button(ai_tab, text="✗ 不是",
                                        command=lambda: self._ai_cycle_candidate(1))
@@ -757,7 +1048,11 @@ class StepApp(tk.Tk):
                 marks += " ⏹"  # 有执行后标准图
             if step.get("x") is not None and step.get("y") is not None:
                 marks += " 🎯"  # AI 精确定位(带像素坐标)
-            self.listbox.insert("end", f"{i:2d}. 点击 {step['cell']}{marks}{suffix}")
+            label = f"{i:2d}. 点击 {step['cell']}{marks}{suffix}"
+            desc = (step.get("desc") or "").strip()
+            if desc:
+                label += f"  [{desc}]"
+            self.listbox.insert("end", label)
 
     def _refresh(self) -> None:
         """重新从设备截取当前画面并刷新网格显示(步骤列表保留)。"""
@@ -974,20 +1269,20 @@ class StepApp(tk.Tk):
         try:
             runner.run(self.steps, on_event=self._on_step_event)
         except Exception as exc:  # AdbError / StepError 等,统一在 UI 层提示
-            self.after(0, self._log, f"[失败] {exc}")
+            self._bridge.post(lambda: self._log(f"[失败] {exc}"))
         finally:
-            self.after(0, self._run_finished)
+            self._bridge.post(self._run_finished)
 
     def _run_finished(self) -> None:
         self._running = False
         self.run_btn.configure(state="normal")
 
     def _on_step_event(self, idx: int, total: int, msg: str) -> None:
-        # StepRunner 在后台线程,日志切回主线程刷新
-        self.after(0, self._log, f"[{idx}/{total}] {msg}")
+        # StepRunner 在后台线程,日志经 bridge 切回主线程刷新
+        self._bridge.post(lambda: self._log(f"[{idx}/{total}] {msg}"))
         # 开始执行某步(点击)时,联动选中该步并显示它的预期画面
         if msg.startswith("点击 "):
-            self.after(0, self._preview_running_step, idx - 1)
+            self._bridge.post(lambda: self._preview_running_step(idx - 1))
 
     def _preview_running_step(self, index: int) -> None:
         """执行过程中高亮当前步并展示其预期画面(不改编辑用的等待输入框)。"""
@@ -1038,6 +1333,7 @@ class StepApp(tk.Tk):
         if not instruction or self._ai_busy:
             return
         self._ai_input_var.set("")
+        self._ai_instruction = instruction  # 确认后随步骤保存为 desc
 
         # 清除上一次的候选预览
         self._ai_confirm_btn.grid_remove()
@@ -1081,10 +1377,10 @@ class StepApp(tk.Tk):
             if cfg.mode == "ocr_only":
                 cfg.verify.enabled = False
             result = locate_pipeline.locate(image, instruction, cfg)
-            self.after(0, self._ai_locate_done, result)
+            self._bridge.post(lambda: self._ai_locate_done(result))
         except Exception as exc:  # 管线内任何异常都回显,不崩 GUI
-            self.after(0, self._ai_log, f"定位异常: {exc}")
-            self.after(0, self._ai_locate_error, str(exc))
+            self._bridge.post(lambda: self._ai_log(f"定位异常: {exc}"))
+            self._bridge.post(lambda: self._ai_locate_error(str(exc)))
 
     def _ai_locate_error(self, msg: str) -> None:
         self._ai_busy = False
@@ -1137,7 +1433,9 @@ class StepApp(tk.Tk):
         self._ai_cand_info_var.set(info.strip())
         if not silent:
             self._ai_chat_append("AI", f"候选 {idx + 1}/{n}: 格子 {cell} ({x},{y}) "
-                                       f"[{sources}] 置信度 {cand.confidence:.2f} {ver}")
+                                       f"[{sources}] 置信度 {cand.confidence:.2f} {ver}"
+                                       "(自动刷新已暂停,点「✓ 保存为步骤」确认,"
+                                       "或「⟳ 刷新截图」丢弃)")
             self._ai_log(f"候选{idx + 1}/{n} {cell} ({x},{y}) {sources} "
                          f"conf={cand.confidence:.2f} {ver}")
         self._ai_confirm_btn.grid()
@@ -1154,14 +1452,18 @@ class StepApp(tk.Tk):
             return
         n = len(result.top_candidates)
         if n <= 1:
-            self._ai_chat_append("AI", "只有一个候选。可在普通模式直接点格子手动指定。")
+            # 只有一个候选时「✗ 不是」= 丢弃本次提案:
+            # 否则候选一直挂着,自动刷新会一直处于暂停状态
+            self._reset_ai_proposal_ui()
+            self._ai_chat_append("AI", "好,已丢弃这个候选。可以重新输入指令,"
+                                       "或切到普通模式点格子手动指定。")
             return
         self._ai_adjusted = False
         self._ai_drag_last = None
         self._show_candidate((self._ai_cand_idx + delta) % n)
 
     def _ai_confirm(self) -> None:
-        """确认当前候选 -> 带像素坐标的 tap 步骤入库。"""
+        """确认当前候选 -> 带像素坐标的 tap 步骤入库(指令文本存为 desc)。"""
         result = self._ai_result
         if result is None or not result.top_candidates:
             return
@@ -1176,6 +1478,7 @@ class StepApp(tk.Tk):
             "wait_after": self._spin_value(self.after_var),
             "before_image": "",
             "after_image": "",
+            "desc": (self._ai_instruction or "").strip(),  # 用户指令文本,便于阅读脚本
         }
         before_rel = self._capture_anchor_now("before")
         if before_rel:
@@ -1185,11 +1488,11 @@ class StepApp(tk.Tk):
         self._select_and_preview(len(self.steps) - 1)
         self.listbox.see("end")
 
-        self._ai_chat_append("AI", f"已添加步骤: 点击 {cell} ({x},{y})")
+        self._ai_chat_append("AI", f"已保存为脚本步骤 {len(self.steps)}: "
+                                   f"点击 {cell} ({x},{y})。"
+                                   "可继续输入下一条指令,或到普通模式查看/运行脚本。")
         self._ai_log(f"确认 -> 步骤 {len(self.steps)}: {cell} ({x},{y})")
         self._reset_ai_proposal_ui()
-        # 切到普通模式让用户看到新步骤
-        self.notebook.select(0)
 
     def _reset_ai_proposal_ui(self) -> None:
         """确认/切换截图后复位候选预览状态。"""
@@ -1311,7 +1614,8 @@ class StepApp(tk.Tk):
 
 def main() -> int:
     app = StepApp()
-    if app.winfo_exists():
+    # 用户在设备选择框取消,或首次截图失败:窗口已销毁,不进入主循环
+    if getattr(app, "_startup_ok", False) and app.winfo_exists():
         app.mainloop()
     return 0
 
