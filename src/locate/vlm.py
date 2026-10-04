@@ -128,11 +128,12 @@ class VlmLocator:
         "你要找到用户描述的元素。"
         "坐标使用 0~1000 归一化(左上为 (0,0),右下为 (1000,1000)),"
         "输出格式为严格 JSON: "
-        '{"bbox":[x1,y1,x2,y2], "label":"元素描述", "confidence":0~1}。'
+        '{"thinking":"你对目标外观/位置的简要分析和判断依据",'
+        '"bbox":[x1,y1,x2,y2], "label":"元素描述", "confidence":0~1}。'
         "如果目标是图标(icon 或 icon_with_label),要找的是图标本体本身,"
-        "不是它下方的文字标签。先简要描述外观和大致位置,再输出 bbox。"
+        "不是它下方的文字标签。"
         "如果找不到该元素,返回 "
-        '{"bbox": null, "label": "not found", "confidence": 0}。'
+        '{"thinking":"找不到的原因", "bbox": null, "label": "not found", "confidence": 0}。'
         "只返回 JSON,不要有任何额外文字或代码块标记。"
     )
 

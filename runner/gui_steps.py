@@ -29,6 +29,7 @@ runner/gui_steps.py - 步骤编排可视化界面(Tkinter)
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import sys
@@ -45,8 +46,14 @@ import numpy as np
 # 将 src/ 加入 sys.path(与其他 runner 脚本一致)
 _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 sys.path.insert(0, _SRC_DIR)
+# 项目依赖目录(rapidfuzz/cv2/PIL 等)加入 sys.path:
+# 不设 PYTHONPATH 直接启动 GUI 时,locate 管线也能找到第三方包
+_DEPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_deps")
+if os.path.isdir(_DEPS_DIR):
+    sys.path.insert(0, os.path.abspath(_DEPS_DIR))
 
 import cvio  # noqa: E402  Unicode 路径兼容的图像读写(中文脚本名目录)
+import aiclient  # noqa: E402  AI 调用客户端(trace 钩子用于展示 AI 思考过程)
 from grid import GridMarker, col_name  # noqa: E402
 from steps import StepError, StepRunner, load_steps, save_steps  # noqa: E402
 from adbtools import AdbClient, AdbError  # noqa: E402
@@ -123,6 +130,22 @@ class _UiBridge:
 
     def close(self) -> None:
         self._closed = True
+
+
+class _AiLogHandler(logging.Handler):
+    """把 locate 管线的运行日志(意图解析/OCR/VLM/融合/验证)转发到 AI 日志区。"""
+
+    def __init__(self, app: "StepApp") -> None:
+        super().__init__(level=logging.INFO)
+        self._app = app
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        app = self._app
+        app._bridge.post(lambda m=msg: app._ai_log(m))
 
 
 class DeviceSelectDialog(tk.Toplevel):
@@ -401,6 +424,12 @@ class StepApp(tk.Tk):
         self._build_ui()
         self._startup_ok = True
         self._log(self._startup_msg)
+        # AI 思考过程展示:aiclient 每次请求/回复 + locate 管线各阶段日志 → AI 日志区
+        aiclient.trace = self._ai_trace
+        locate_logger = logging.getLogger("imgloc.locate")
+        locate_logger.setLevel(logging.INFO)
+        if not any(isinstance(h, _AiLogHandler) for h in locate_logger.handlers):
+            locate_logger.addHandler(_AiLogHandler(self))
         # 默认打开 AI 模式 Tab(用户主要工作区)
         self.notebook.select(1)
         # AI 模式欢迎语
@@ -424,6 +453,7 @@ class StepApp(tk.Tk):
 
     def _on_close(self) -> None:
         """主窗口关闭:停止后台->主线程投递,后台线程为 daemon,随进程退出。"""
+        aiclient.trace = None
         self._bridge.close()
         self.destroy()
 
@@ -591,54 +621,51 @@ class StepApp(tk.Tk):
         right = ttk.Frame(self.notebook, padding=(10, 0, 0, 0))
         self.notebook.add(right, text="普通模式")
 
-        ttk.Label(right, text="步骤列表(从上到下顺序执行)").grid(row=0, column=0, columnspan=3, sticky="w")
-        self.listbox = tk.Listbox(right, width=38, height=18, font=("Consolas", 10),
-                                  activestyle="dotbox")
-        self.listbox.grid(row=1, column=0, columnspan=3, pady=4)
-        scroll = ttk.Scrollbar(right, orient="vertical", command=self.listbox.yview)
-        scroll.grid(row=1, column=3, sticky="ns")
-        self.listbox.configure(yscrollcommand=scroll.set)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-
-        # 前/后等待设置:点图新步骤自动带上当前值;修改后点"应用到选中"更新
-        ttk.Label(right, text="执行前等待(秒):").grid(row=2, column=0, sticky="e")
-        self.before_var = tk.StringVar(value="0")
-        ttk.Spinbox(right, from_=0, to=600, width=6, textvariable=self.before_var).grid(
-            row=2, column=1, sticky="w", padx=4)
-        ttk.Label(right, text="执行后等待(秒):").grid(row=3, column=0, sticky="e")
-        self.after_var = tk.StringVar(value="10")
-        ttk.Spinbox(right, from_=0, to=600, width=6, textvariable=self.after_var).grid(
-            row=3, column=1, sticky="w", padx=4)
-        ttk.Button(right, text="应用到选中步骤", command=self._apply_waits).grid(
-            row=2, column=2, rowspan=2, sticky="ns", padx=4)
-
         # 脚本名称:保存前必填;保存成功后清空,回到"新建脚本"状态
-        ttk.Label(right, text="脚本名称:").grid(row=4, column=0, sticky="e")
+        ttk.Label(right, text="脚本名称:").grid(row=0, column=0, sticky="e")
         self.script_name_var = tk.StringVar(value="")
         ttk.Entry(right, textvariable=self.script_name_var).grid(
-            row=4, column=1, columnspan=2, sticky="ew", padx=4, pady=(6, 2))
+            row=0, column=1, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
 
-        ttk.Button(right, text="删除选中", command=self._delete_selected).grid(row=5, column=0, sticky="ew", pady=2)
-        ttk.Button(right, text="上移", command=lambda: self._move(-1)).grid(row=5, column=1, sticky="ew", pady=2)
-        ttk.Button(right, text="下移", command=self._move(1)).grid(row=5, column=2, sticky="ew", pady=2)
-        ttk.Button(right, text="清空", command=self._clear).grid(row=6, column=0, sticky="ew", pady=2)
-        ttk.Button(right, text="保存脚本", command=self._save).grid(row=6, column=1, sticky="ew", pady=2)
-        ttk.Button(right, text="加载脚本", command=self._load).grid(row=6, column=2, sticky="ew", pady=2)
+        ttk.Label(right, text="步骤列表(双击行修改等待时间)").grid(
+            row=1, column=0, columnspan=3, sticky="w")
+
+        # 新增步骤的默认等待时间(不可见,双击行内可改)
+        self.before_var = tk.StringVar(value="0")
+        self.after_var = tk.StringVar(value="10")
+
+        self.listbox = tk.Listbox(right, width=38, height=18, font=("Consolas", 10),
+                                  activestyle="dotbox")
+        self.listbox.grid(row=2, column=0, columnspan=3, pady=4)
+        scroll = ttk.Scrollbar(right, orient="vertical", command=self.listbox.yview)
+        scroll.grid(row=2, column=3, sticky="ns")
+        self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Double-Button-1>", self._on_step_double_click)
+
+        ttk.Button(right, text="删除选中", command=self._delete_selected).grid(row=4, column=0, sticky="ew", pady=2)
+        ttk.Button(right, text="上移", command=lambda: self._move(-1)).grid(row=4, column=1, sticky="ew", pady=2)
+        ttk.Button(right, text="下移", command=self._move(1)).grid(row=4, column=2, sticky="ew", pady=2)
+        ttk.Button(right, text="清空", command=self._clear).grid(row=5, column=0, sticky="ew", pady=2)
+        ttk.Button(right, text="保存脚本", command=self._save).grid(row=5, column=1, sticky="ew", pady=2)
+        ttk.Button(right, text="加载脚本", command=self._load).grid(row=5, column=2, sticky="ew", pady=2)
 
         ttk.Button(right, text="⟳ 刷新截图", command=self._refresh).grid(
-            row=7, column=0, columnspan=2, sticky="ew", pady=2)
+            row=6, column=0, columnspan=2, sticky="ew", pady=2)
         self._auto_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="自动刷新(1秒)", variable=self._auto_var).grid(
-            row=7, column=2, sticky="w", padx=4)
+            row=6, column=2, sticky="w", padx=4)
 
         self.run_btn = ttk.Button(right, text="▶ 运行", command=self._run)
-        self.run_btn.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        self.run_btn.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
+        self.full_run_btn = ttk.Button(right, text="🎬 完整运行", command=self._full_run)
+        self.full_run_btn.grid(row=7, column=2, sticky="ew", pady=(8, 2), padx=(2, 0))
 
         # 右下:执行日志
-        ttk.Label(right, text="执行日志:").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(right, text="执行日志:").grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.log_text = tk.Text(right, width=42, height=10, font=("Consolas", 9),
                                 state="disabled", bg="#111", fg="#0f0")
-        self.log_text.grid(row=10, column=0, columnspan=3, pady=2)
+        self.log_text.grid(row=9, column=0, columnspan=3, pady=2)
 
         # ---- Tab 2: AI 模式(对话式步骤编排) ----
         ai_tab = ttk.Frame(self.notebook, padding=(10, 0, 0, 0))
@@ -700,49 +727,76 @@ class StepApp(tk.Tk):
             row=7, column=0, columnspan=3, sticky="ew", pady=(8, 2))
 
         # AI 模式日志
-        ttk.Label(ai_tab, text="AI 模式日志:").grid(
+        ttk.Label(ai_tab, text="AI 模式日志(含 AI 思考过程):").grid(
             row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self._ai_log_text = tk.Text(ai_tab, width=42, height=8, font=("Consolas", 9),
-                                    state="disabled", bg="#111", fg="#0f0")
-        self._ai_log_text.grid(row=9, column=0, columnspan=3, pady=2)
+        self._ai_log_text = tk.Text(ai_tab, width=42, height=16, font=("Consolas", 9),
+                                    state="disabled", bg="#111", fg="#0f0", wrap="word")
+        self._ai_log_text.grid(row=9, column=0, columnspan=2, pady=2)
+        ai_log_scroll = ttk.Scrollbar(ai_tab, orient="vertical",
+                                      command=self._ai_log_text.yview)
+        ai_log_scroll.grid(row=9, column=2, sticky="ns")
+        self._ai_log_text.configure(yscrollcommand=ai_log_scroll.set)
 
-        # 最右:当前步骤的标准图(执行前/执行后),两种模式共享
+        # 最右:当前步骤的标准图(执行前/执行后)+ 步骤详情,两种模式共享
         preview = ttk.Frame(root, padding=(10, 0, 0, 0))
         preview.grid(row=0, column=2, sticky="n")
-        ttk.Label(preview, text="当前步骤标准图").grid(row=0, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(preview, text="执行前(开始条件):").grid(row=1, column=0, columnspan=2, sticky="w",
+        # ---- 步骤详情:选中列表步骤后在此展示,可直接修改前/后等待时间 ----
+        self._preview_index: Optional[int] = None  # 当前详情面板对应的步骤下标
+        ttk.Label(preview, text="步骤详情").grid(row=0, column=0, columnspan=2, sticky="w")
+        self._detail_info_var = tk.StringVar(value="未选中步骤")
+        ttk.Label(preview, textvariable=self._detail_info_var,
+                  foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        waits_frm = ttk.Frame(preview)
+        waits_frm.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(waits_frm, text="前等待").pack(side="left")
+        self._detail_before_var = tk.StringVar(value="0")
+        ttk.Spinbox(waits_frm, from_=0, to=600, width=5,
+                    textvariable=self._detail_before_var).pack(side="left")
+        ttk.Label(waits_frm, text="s  后等待").pack(side="left")
+        self._detail_after_var = tk.StringVar(value="0")
+        ttk.Spinbox(waits_frm, from_=0, to=600, width=5,
+                    textvariable=self._detail_after_var).pack(side="left")
+        ttk.Label(waits_frm, text="s").pack(side="left")
+        ttk.Button(waits_frm, text="保存", command=self._apply_step_detail).pack(
+            side="left", padx=(6, 0))
+
+        ttk.Label(preview, text="当前步骤标准图").grid(row=3, column=0, columnspan=2, sticky="w",
+                                                        pady=(8, 0))
+
+        ttk.Label(preview, text="执行前(开始条件):").grid(row=4, column=0, columnspan=2, sticky="w",
                                                            pady=(6, 0))
         self._before_photo = self._make_placeholder_image()
         self.before_img_label = tk.Label(
             preview, image=self._before_photo,
             width=EXPECT_IMG_W, height=EXPECT_IMG_H,
             highlightthickness=1, highlightbackground="#555", bg="#222")
-        self.before_img_label.grid(row=2, column=0, columnspan=2, pady=2)
+        self.before_img_label.grid(row=5, column=0, columnspan=2, pady=2)
         self.before_status_var = tk.StringVar(value="未选中步骤")
         ttk.Label(preview, textvariable=self.before_status_var,
                   foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
-            row=3, column=0, columnspan=2, sticky="w")
+            row=6, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(preview, text="执行后(完成条件):").grid(row=4, column=0, columnspan=2, sticky="w",
+        ttk.Label(preview, text="执行后(完成条件):").grid(row=7, column=0, columnspan=2, sticky="w",
                                                            pady=(6, 0))
         self._after_photo = self._make_placeholder_image()
         self.after_img_label = tk.Label(
             preview, image=self._after_photo,
             width=EXPECT_IMG_W, height=EXPECT_IMG_H,
             highlightthickness=1, highlightbackground="#555", bg="#222")
-        self.after_img_label.grid(row=5, column=0, columnspan=2, pady=2)
+        self.after_img_label.grid(row=8, column=0, columnspan=2, pady=2)
         self.after_status_var = tk.StringVar(value="未选中步骤")
         ttk.Label(preview, textvariable=self.after_status_var,
                   foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
-            row=6, column=0, columnspan=2, sticky="w")
+            row=9, column=0, columnspan=2, sticky="w")
 
         ttk.Button(preview, text="📷 重拍执行前图",
                    command=lambda: self._recapture_anchor("before_image")).grid(
-            row=7, column=0, sticky="ew", pady=(6, 2), padx=(0, 2))
+            row=10, column=0, sticky="ew", pady=(6, 2), padx=(0, 2))
         ttk.Button(preview, text="📷 截执行后图",
                    command=lambda: self._recapture_anchor("after_image")).grid(
-            row=7, column=1, sticky="ew", pady=(6, 2), padx=(2, 0))
+            row=10, column=1, sticky="ew", pady=(6, 2), padx=(2, 0))
 
     # ------------------------------------------------------------------
     # 步骤编辑
@@ -924,14 +978,27 @@ class StepApp(tk.Tk):
         执行后:本步 after_image;缺省时提示"默认=下一步执行前图"(引擎自动链接)。
         """
         if index is None or not (0 <= index < len(self.steps)):
+            self._preview_index = None
+            self._detail_info_var.set("未选中步骤")
             self._set_preview_image("before", None)
             self._set_preview_image("after", None)
             self.before_status_var.set("未选中步骤")
             self.after_status_var.set("未选中步骤")
             return
 
+        self._preview_index = index
         step = self.steps[index]
         title = f"第 {index + 1} 步 {step['cell']}"
+
+        # ---- 步骤详情(可编辑前/后等待) ----
+        is_input = step.get("type") == "input"
+        kind = f"输入 \"{step.get('text', '')}\"" if is_input else "点击"
+        coord = (f"({step['x']}, {step['y']})"
+                 if step.get("x") is not None and step.get("y") is not None else "-")
+        self._detail_info_var.set(
+            f"第 {index + 1} 步  {kind}  {step['cell']}  {coord}")
+        self._detail_before_var.set(f"{step.get('delay_before', 0):g}")
+        self._detail_after_var.set(f"{step.get('wait_after', 0):g}")
 
         # 执行前
         before_rel = step.get("before_image", "")
@@ -974,36 +1041,81 @@ class StepApp(tk.Tk):
             return 0.0
 
     def _on_select(self, _event: tk.Event) -> None:
-        """选中步骤时,把该步骤的前/后等待回填到输入框,并显示预期画面。"""
+        """选中步骤时显示其预期画面。"""
         sel = self.listbox.curselection()
         if len(sel) == 1:
-            i = sel[0]
-            step = self.steps[i]
-            self.before_var.set(f"{step.get('delay_before', 0):g}")
-            self.after_var.set(f"{step.get('wait_after', 0):g}")
-            self._show_expect_preview(i)
+            self._show_expect_preview(sel[0])
 
-    def _apply_waits(self) -> None:
-        """把输入框中的前/后等待写回选中的步骤。"""
-        sel = self.listbox.curselection()
-        if not sel:
+    def _apply_step_detail(self) -> None:
+        """把右侧详情面板中的前/后等待写回当前选中步骤。"""
+        i = self._preview_index
+        if i is None or not (0 <= i < len(self.steps)):
             messagebox.showinfo("未选中", "请先在列表中选中一个步骤")
             return
-        for i in sel:
-            self.steps[i]["delay_before"] = self._spin_value(self.before_var)
-            self.steps[i]["wait_after"] = self._spin_value(self.after_var)
+        # 强制焦点提交 Spinbox 正在编辑的值
+        self.focus_set()
+        self.update_idletasks()
+        db = self._spin_value(self._detail_before_var)
+        da = self._spin_value(self._detail_after_var)
+        self.steps[i]["delay_before"] = db
+        self.steps[i]["wait_after"] = da
         self._refresh_list()
-        for i in sel:
+        self._select_and_preview(i)
+        self._log(f"[修改] 第 {i + 1} 步等待: 前 {db:g}s / 后 {da:g}s")
+
+    def _on_step_double_click(self, event: tk.Event) -> None:
+        """双击列表行:弹窗直接修改该步骤的前/后等待时间。"""
+        # 以双击位置为准确定行(双击时选中事件可能尚未更新)
+        i = self.listbox.nearest(event.y)
+        if not (0 <= i < len(self.steps)):
+            return
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(i)
+        self._edit_step_waits(i)
+
+    def _edit_step_waits(self, i: int) -> None:
+        """小弹窗编辑第 i 步的 delay_before / wait_after。"""
+        step = self.steps[i]
+        dlg = tk.Toplevel(self)
+        dlg.title(f"第 {i + 1} 步 - 等待时间")
+        dlg.resizable(False, False)
+        dlg.transient(self.winfo_toplevel())
+
+        ttk.Label(dlg, text="执行前等待(秒):").grid(row=0, column=0, padx=10, pady=(12, 4), sticky="e")
+        before_var = tk.StringVar(value=f"{step.get('delay_before', 0):g}")
+        ttk.Spinbox(dlg, from_=0, to=600, width=8, textvariable=before_var).grid(
+            row=0, column=1, padx=10, pady=(12, 4))
+        ttk.Label(dlg, text="执行后等待(秒):").grid(row=1, column=0, padx=10, pady=4, sticky="e")
+        after_var = tk.StringVar(value=f"{step.get('wait_after', 0):g}")
+        ttk.Spinbox(dlg, from_=0, to=600, width=8, textvariable=after_var).grid(
+            row=1, column=1, padx=10, pady=4)
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=2, column=0, columnspan=2, pady=(8, 12))
+
+        def _ok() -> None:
+            # 强制焦点提交 Spinbox 正在编辑的值
+            dlg.focus_set()
+            dlg.update_idletasks()
+            step["delay_before"] = self._spin_value(before_var)
+            step["wait_after"] = self._spin_value(after_var)
+            self._refresh_list()
             self.listbox.selection_set(i)
+            self.listbox.see(i)
+            self._log(f"[修改] 第 {i + 1} 步等待: 前 {step['delay_before']:g}s / 后 {step['wait_after']:g}s")
+            dlg.destroy()
+
+        ttk.Button(btns, text="确定", command=_ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda _e: _ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()  # 模态
 
     def _select_and_preview(self, index: Optional[int]) -> None:
         """程序化选中某步并刷新预期画面(selection_set 不触发 <<ListboxSelect>>)。"""
         self.listbox.selection_clear(0, "end")
         if index is not None and 0 <= index < len(self.steps):
             self.listbox.selection_set(index)
-            step = self.steps[index]
-            self.before_var.set(f"{step.get('delay_before', 0):g}")
-            self.after_var.set(f"{step.get('wait_after', 0):g}")
             self._show_expect_preview(index)
         else:
             self._show_expect_preview(None)
@@ -1038,9 +1150,8 @@ class StepApp(tk.Tk):
         for i, step in enumerate(self.steps, 1):
             before_wait = step.get("delay_before", 0)
             after_wait = step.get("wait_after", 0)
-            suffix = ""
-            if before_wait or after_wait:
-                suffix = f"  (前{before_wait:g}s/后{after_wait:g}s)"
+            # 全信息显示:每行都带前/后等待时间
+            suffix = f"  (前{before_wait:g}s/后{after_wait:g}s)"
             marks = ""
             if step.get("before_image"):
                 marks += " ▶"  # 有执行前标准图
@@ -1048,7 +1159,10 @@ class StepApp(tk.Tk):
                 marks += " ⏹"  # 有执行后标准图
             if step.get("x") is not None and step.get("y") is not None:
                 marks += " 🎯"  # AI 精确定位(带像素坐标)
-            label = f"{i:2d}. 点击 {step['cell']}{marks}{suffix}"
+            if step.get("type") == "input":
+                label = f"{i:2d}. 输入 {step['cell']} \"{step.get('text', '')}\"{marks}{suffix}"
+            else:
+                label = f"{i:2d}. 点击 {step['cell']}{marks}{suffix}"
             desc = (step.get("desc") or "").strip()
             if desc:
                 label += f"  [{desc}]"
@@ -1238,10 +1352,33 @@ class StepApp(tk.Tk):
         if not self.steps:
             messagebox.showwarning("无步骤", "请先在左侧图片上点击格子添加步骤")
             return
+        # 选中且仅选中一个步骤时:只执行该步;否则从头顺序执行全部
+        sel = self.listbox.curselection()
+        if len(sel) == 1:
+            self._run_offset = sel[0]
+            run_steps = [self.steps[sel[0]]]
+        else:
+            self._run_offset = 0
+            run_steps = self.steps
+        self._start_run(run_steps, record=False)
+
+    def _full_run(self) -> None:
+        """完整运行:忽略选中态从头跑全部步骤,并自动录制 + 渲染回放视频。"""
+        if self._running:
+            return
+        if not self.steps:
+            messagebox.showwarning("无步骤", "请先在左侧图片上点击格子添加步骤")
+            return
+        self._run_offset = 0
+        self._start_run(list(self.steps), record=True)
+
+    def _start_run(self, run_steps: List[Dict[str, Any]], record: bool) -> None:
+        """_run/_full_run 共用的执行入口:停刷新 -> 建 runner -> 起后台线程。"""
         # 先进入运行态:阻止新的自动刷新启动;再等在途刷新落盘完成,
         # 避免读到半写入的 screenshot.png / 与执行轮询争抢 adb
         self._running = True
         self.run_btn.configure(state="disabled")
+        self.full_run_btn.configure(state="disabled")
         deadline = time.monotonic() + 3.0
         while self._auto_busy and time.monotonic() < deadline:
             self.update()
@@ -1255,34 +1392,72 @@ class StepApp(tk.Tk):
         except StepError as exc:
             self._running = False
             self.run_btn.configure(state="normal")
+            self.full_run_btn.configure(state="normal")
             messagebox.showerror("执行环境缺失", str(exc))
             return
         # 锚点图相对路径以当前脚本 JSON 所在目录为基准(未保存草稿用 scripts/untitled/)
         runner.script_dir = (os.path.dirname(os.path.abspath(self.script_path))
                              if self.script_path
                              else os.path.join(SCRIPTS_DIR, DRAFT_SCRIPT_NAME))
-        self._log(f"开始执行脚本 [{self.script_name}],共 {len(self.steps)} 步,"
-                  f"设备: {runner.device_id}")
-        threading.Thread(target=self._run_worker, args=(runner,), daemon=True).start()
+        if record:
+            self._log(f"开始完整运行脚本 [{self.script_name}],共 {len(run_steps)} 步"
+                      f"(自动录制+回放),设备: {runner.device_id}")
+        elif self._run_offset:
+            self._log(f"开始执行选中步骤 第 {self._run_offset + 1} 步,"
+                      f"设备: {runner.device_id}")
+        else:
+            self._log(f"开始执行脚本 [{self.script_name}],共 {len(self.steps)} 步,"
+                      f"设备: {runner.device_id}")
+        threading.Thread(target=self._run_worker,
+                         args=(runner, run_steps, record), daemon=True).start()
 
-    def _run_worker(self, runner: StepRunner) -> None:
+    def _run_worker(self, runner: StepRunner, run_steps: List[Dict[str, Any]],
+                    record: bool) -> None:
+        recorder = None
         try:
-            runner.run(self.steps, on_event=self._on_step_event)
+            if record:
+                from recording import Recorder
+                recorder = Recorder.create(device_id=runner.device_id)
+                rec_path = recorder.recording_path
+                self._bridge.post(lambda p=rec_path: self._log(f"[录制] 运行目录: {p}"))
+            runner.run(run_steps, on_event=self._on_step_event, recorder=recorder)
         except Exception as exc:  # AdbError / StepError 等,统一在 UI 层提示
-            self._bridge.post(lambda: self._log(f"[失败] {exc}"))
+            err_msg = str(exc)
+            self._bridge.post(lambda m=err_msg: self._log(f"[失败] {m}"))
         finally:
-            self._bridge.post(self._run_finished)
+            self._bridge.post(lambda: self._run_finished(recorder))
 
-    def _run_finished(self) -> None:
+    def _run_finished(self, recorder=None) -> None:
         self._running = False
         self.run_btn.configure(state="normal")
+        self.full_run_btn.configure(state="normal")
+        # 完整运行:录制已收尾(recording.json 落盘),后台渲染回放视频
+        if recorder is not None and os.path.isfile(recorder.recording_path):
+            rec_path = recorder.recording_path
+            threading.Thread(target=self._render_worker,
+                             args=(rec_path,), daemon=True).start()
+
+    def _render_worker(self, recording_path: str) -> None:
+        """后台渲染回放视频(测试报告),结果回执行日志。"""
+        try:
+            self._bridge.post(lambda: self._log("[回放] 正在渲染回放视频…"))
+            from replay_render import render_to_video
+            out = render_to_video(recording_path)
+            size_mb = os.path.getsize(out) / 1048576
+            self._bridge.post(
+                lambda o=out, s=size_mb: self._log(f"[回放] 视频已生成: {o} ({s:.2f} MB)"))
+        except Exception as exc:
+            err_msg = str(exc)
+            self._bridge.post(lambda m=err_msg: self._log(f"[回放] 渲染失败: {m}"))
 
     def _on_step_event(self, idx: int, total: int, msg: str) -> None:
         # StepRunner 在后台线程,日志经 bridge 切回主线程刷新
         self._bridge.post(lambda: self._log(f"[{idx}/{total}] {msg}"))
-        # 开始执行某步(点击)时,联动选中该步并显示它的预期画面
-        if msg.startswith("点击 "):
-            self._bridge.post(lambda: self._preview_running_step(idx - 1))
+        # 开始执行某步(点击/输入)时,联动选中该步并显示它的预期画面
+        # (单步执行时 idx 从 1 重新计,需加 _run_offset 映射回完整列表下标)
+        if msg.startswith("点击 ") or msg.startswith("输入 "):
+            offset = getattr(self, "_run_offset", 0)
+            self._bridge.post(lambda: self._preview_running_step(idx - 1 + offset))
 
     def _preview_running_step(self, index: int) -> None:
         """执行过程中高亮当前步并展示其预期画面(不改编辑用的等待输入框)。"""
@@ -1301,6 +1476,10 @@ class StepApp(tk.Tk):
     # ------------------------------------------------------------------
     # AI 模式
     # ------------------------------------------------------------------
+    def _ai_trace(self, msg: str) -> None:
+        """aiclient trace 钩子:AI 请求/回复(思考过程)经 bridge 进 AI 日志区。"""
+        self._bridge.post(lambda: self._ai_log(msg))
+
     def _ai_log(self, msg: str) -> None:
         """写入 AI 模式日志区。"""
         self._ai_log_text.configure(state="normal")
@@ -1379,8 +1558,11 @@ class StepApp(tk.Tk):
             result = locate_pipeline.locate(image, instruction, cfg)
             self._bridge.post(lambda: self._ai_locate_done(result))
         except Exception as exc:  # 管线内任何异常都回显,不崩 GUI
-            self._bridge.post(lambda: self._ai_log(f"定位异常: {exc}"))
-            self._bridge.post(lambda: self._ai_locate_error(str(exc)))
+            # except 块结束后 exc 会被 Python 删除,lambda 延迟执行取不到,
+            # 必须先落地为普通局部变量再捕获
+            err_msg = str(exc)
+            self._bridge.post(lambda m=err_msg: self._ai_log(f"定位异常: {m}"))
+            self._bridge.post(lambda m=err_msg: self._ai_locate_error(m))
 
     def _ai_locate_error(self, msg: str) -> None:
         self._ai_busy = False
@@ -1463,7 +1645,7 @@ class StepApp(tk.Tk):
         self._show_candidate((self._ai_cand_idx + delta) % n)
 
     def _ai_confirm(self) -> None:
-        """确认当前候选 -> 带像素坐标的 tap 步骤入库(指令文本存为 desc)。"""
+        """确认当前候选 -> 带像素坐标的 tap/input 步骤入库(指令文本存为 desc)。"""
         result = self._ai_result
         if result is None or not result.top_candidates:
             return
@@ -1471,8 +1653,14 @@ class StepApp(tk.Tk):
         x, y = int(cand.point[0]), int(cand.point[1])
         cell = self._cell_for_point(x, y)
 
+        # 意图:点击 or 输入(定位管线已解析,随 result 带出)
+        intent = getattr(result, "intent", None)
+        action = getattr(intent, "action", "tap") or "tap"
+        input_text = (getattr(intent, "input_text", "") or "").strip()
+
         step = {
-            "type": "tap", "cell": cell,
+            "type": "input" if (action == "input" and input_text) else "tap",
+            "cell": cell,
             "x": x, "y": y,  # 精确像素坐标,回放时优先于格子换算
             "delay_before": self._spin_value(self.before_var),
             "wait_after": self._spin_value(self.after_var),
@@ -1480,6 +1668,8 @@ class StepApp(tk.Tk):
             "after_image": "",
             "desc": (self._ai_instruction or "").strip(),  # 用户指令文本,便于阅读脚本
         }
+        if step["type"] == "input":
+            step["text"] = input_text
         before_rel = self._capture_anchor_now("before")
         if before_rel:
             step["before_image"] = before_rel
@@ -1488,10 +1678,21 @@ class StepApp(tk.Tk):
         self._select_and_preview(len(self.steps) - 1)
         self.listbox.see("end")
 
-        self._ai_chat_append("AI", f"已保存为脚本步骤 {len(self.steps)}: "
-                                   f"点击 {cell} ({x},{y})。"
-                                   "可继续输入下一条指令,或到普通模式查看/运行脚本。")
-        self._ai_log(f"确认 -> 步骤 {len(self.steps)}: {cell} ({x},{y})")
+        if step["type"] == "input":
+            warn = ""
+            if any(ord(ch) > 127 for ch in input_text):
+                warn = "。⚠ 含非 ASCII 字符(如中文),adb input text 可能无法输入"
+            self._ai_chat_append(
+                "AI", f"已保存为脚本步骤 {len(self.steps)}: 在 {cell} ({x},{y}) "
+                      f"输入 {input_text!r}{warn}。"
+                      "可继续输入下一条指令,或到普通模式查看/运行脚本。")
+            self._ai_log(f"确认 -> 步骤 {len(self.steps)}: input {cell} ({x},{y}) "
+                         f"text={input_text!r}")
+        else:
+            self._ai_chat_append("AI", f"已保存为脚本步骤 {len(self.steps)}: "
+                                       f"点击 {cell} ({x},{y})。"
+                                       "可继续输入下一条指令,或到普通模式查看/运行脚本。")
+            self._ai_log(f"确认 -> 步骤 {len(self.steps)}: {cell} ({x},{y})")
         self._reset_ai_proposal_ui()
 
     def _reset_ai_proposal_ui(self) -> None:

@@ -269,6 +269,34 @@ class AdbClient:
         logger.info("[AdbClient] 点击 (%d, %d) @ %s", x, y, self.device_id)
         self._run(["shell", "input", "tap", str(x), str(y)], timeout=timeout)
 
+    def text(self, text: str, timeout: float = 15.0) -> None:
+        """
+        在当前焦点输入框输入文本:adb -s <device_id> shell input text <text>。
+
+        说明:
+            - 系统 `input text` 仅支持 ASCII 可见字符;空格用 %s 转义;
+            - 中文等非 ASCII 字符设备端会被忽略,需借助 ADBKeyBoard 等
+              输入法方案(本项目暂未集成),建议仅用于英文/数字/符号输入;
+            - 特殊字符 & | ; $ < > 等经单引号包裹 + 转义后传递,防止被设备 shell 解释。
+
+        Args:
+            text: 要输入的文本(空串直接返回,不发命令)。
+            timeout: 命令超时时间(秒),默认 15 秒。
+
+        Raises:
+            AdbError: 尚未 connect/attach(无 device_id),或命令执行失败时抛出。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        if not text:
+            return
+        # input text 约定:空格必须写成 %s
+        escaped = text.replace(" ", "%s")
+        # 单引号包裹,内部单引号按 POSIX 规则转义为 '\'' ,防设备 shell 展开 $ & | ; 等
+        escaped = "'" + escaped.replace("'", "'\\''") + "'"
+        logger.info("[AdbClient] 输入文本 (%d 字符) @ %s", len(text), self.device_id)
+        self._run(["shell", "input", "text", escaped], timeout=timeout)
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------

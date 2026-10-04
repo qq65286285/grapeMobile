@@ -42,10 +42,12 @@ class Candidate:
 class Intent:
     """Step A: 意图解析结果。"""
 
-    target_text: str               # 提取的目标文字(如 "KOF:Legend")
+    target_text: str               # 提取的目标文字(如 "KOF:Legend";输入指令时为输入框)
     target_type: str               # icon_with_label | text | icon | other
     visual_hint: str = ""          # 外观提示(如 "左上角的红色图标")
     raw_query: str = ""            # 用户原始输入
+    action: str = "tap"            # tap | input(点击 | 输入文字)
+    input_text: str = ""           # action=input 时要输入的文本
 
 
 @dataclass
@@ -63,3 +65,4 @@ class LocateResult:
     query: str = ""                           # 用户原始描述
     candidates: List[Candidate] = field(default_factory=list)  # 所有候选(调试用)
     top_candidates: List[Candidate] = field(default_factory=list)  # 融合排序后的候选(GUI 切换用)
+    intent: Optional[Intent] = None               # 意图解析结果(GUI 据此区分点击/输入)

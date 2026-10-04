@@ -46,7 +46,13 @@ DEFAULT_STEPS_FILE = os.path.join(_BASE_DIR, "scripts", "steps", "steps.json")
 
 
 def main() -> int:
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_STEPS_FILE
+    args = sys.argv[1:]
+    # 默认录制并自动出片;--no-record 关闭
+    record_enabled = True
+    if "--no-record" in args:
+        record_enabled = False
+        args.remove("--no-record")
+    path = args[0] if args else DEFAULT_STEPS_FILE
 
     try:
         steps = load_steps(path)
@@ -56,6 +62,13 @@ def main() -> int:
     except StepError as exc:
         print(f"[ERROR] {exc}")
         return 1
+
+    # 录制器:执行前创建,执行结束自动收尾(异常也会收尾)
+    recorder = None
+    if record_enabled:
+        from recording import Recorder
+
+        recorder = Recorder.create(device_id=runner.device_id)
 
     print("=" * 56)
     print(f"步骤文件: {os.path.abspath(path)}")
@@ -81,10 +94,25 @@ def main() -> int:
     print("=" * 56)
 
     try:
-        runner.run(steps, on_event=lambda i, n, m: print(f"[{i}/{n}] {m}"))
+        runner.run(
+            steps,
+            on_event=lambda i, n, m: print(f"[{i}/{n}] {m}"),
+            recorder=recorder,
+        )
     except (StepError, AdbError) as exc:
         print(f"[ERROR] 执行失败: {exc}")
+        if recorder is not None:
+            print(f"失败录制记录: {recorder.recording_path}")
         return 1
+
+    # 自动渲染回放视频
+    if recorder is not None:
+        from replay_render import render_to_video
+
+        print("-" * 56)
+        print("正在渲染回放视频…")
+        out = render_to_video(recorder.recording_path)
+        print(f"回放视频: {out} ({os.path.getsize(out)/1048576:.2f} MB)")
     return 0
 
 

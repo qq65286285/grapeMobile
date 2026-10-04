@@ -81,12 +81,13 @@ def validate_steps(steps: Any) -> List[Step]:
     """
     校验并规范化步骤列表。
 
-    每个 tap 步骤支持:
+    每个 tap/input 步骤支持:
         delay_before: 执行前固定等待秒数(默认 0);
         wait_after:   点击后"等待画面到达"的超时上限秒数(默认 0,无锚点时即固定等待);
         before_image: 执行前标准图(开始条件)——本步执行前设备应显示的画面;
         after_image:  执行后标准图(完成条件)——本步点击后应跳转到的画面。
                       缺省时,引擎自动用"下一步的 before_image"作为本步完成条件。
+        text:         input 步骤专用:要输入的文本(仅支持英文/数字,中文受限)。
     旧字段 expect_image 等价于 before_image(仅加载兼容,保存时不再写出)。
 
     Raises:
@@ -102,62 +103,68 @@ def validate_steps(steps: Any) -> List[Step]:
         if not isinstance(step, dict):
             raise StepError(f"第 {i} 步必须是对象,实际: {step!r}")
         stype = step.get("type")
-        if stype == "tap":
-            cell = str(step.get("cell", "")).strip().upper()
+        if stype not in ("tap", "input"):
+            raise StepError(f"第 {i} 步类型未知: {stype!r}(支持 tap/input)")
 
-            # 可选:精确像素坐标(AI 定位产出);提供时优先于格子换算,
-            # 此时 cell 仅用于显示/兼容,允许为空
-            def _coord_field(field: str):
-                value = step.get(field)
-                if value in (None, ""):
-                    return None
-                try:
-                    ival = int(value)
-                except (TypeError, ValueError) as exc:
-                    raise StepError(f"第 {i} 步 {field} 必须是整数像素坐标: {value!r}") from exc
-                if ival < 0:
-                    raise StepError(f"第 {i} 步 {field} 不能为负: {ival}")
-                return ival
+        cell = str(step.get("cell", "")).strip().upper()
 
-            px = _coord_field("x")
-            py = _coord_field("y")
-            if (px is None) != (py is None):
-                raise StepError(f"第 {i} 步 x/y 必须同时提供或同时省略")
+        # 可选:精确像素坐标(AI 定位产出);提供时优先于格子换算,
+        # 此时 cell 仅用于显示/兼容,允许为空
+        def _coord_field(field: str):
+            value = step.get(field)
+            if value in (None, ""):
+                return None
+            try:
+                ival = int(value)
+            except (TypeError, ValueError) as exc:
+                raise StepError(f"第 {i} 步 {field} 必须是整数像素坐标: {value!r}") from exc
+            if ival < 0:
+                raise StepError(f"第 {i} 步 {field} 不能为负: {ival}")
+            return ival
 
-            if cell:
-                try:
-                    parse_ref(cell)
-                except ValueError as exc:
-                    raise StepError(f"第 {i} 步格子编号非法: {exc}") from exc
-            elif px is None:
-                raise StepError(f"第 {i} 步必须提供 cell 或 x/y 像素坐标")
+        px = _coord_field("x")
+        py = _coord_field("y")
+        if (px is None) != (py is None):
+            raise StepError(f"第 {i} 步 x/y 必须同时提供或同时省略")
 
-            def _img_field(field: str) -> str:
-                value = step.get(field, "")
-                if value is not None and not isinstance(value, str):
-                    raise StepError(f"第 {i} 步 {field} 必须是字符串路径: {value!r}")
-                return (value or "").strip()
+        if cell:
+            try:
+                parse_ref(cell)
+            except ValueError as exc:
+                raise StepError(f"第 {i} 步格子编号非法: {exc}") from exc
+        elif px is None:
+            raise StepError(f"第 {i} 步必须提供 cell 或 x/y 像素坐标")
 
-            before_image = _img_field("before_image")
-            # 兼容旧脚本:expect_image 语义即 before_image
-            if not before_image:
-                before_image = _img_field("expect_image")
-            after_image = _img_field("after_image")
-            # 可选人类可读描述(GUI AI 模式保存步骤时附带的用户指令文本)
-            desc = step.get("desc")
-            normalized.append({
-                "type": "tap",
-                "cell": cell,
-                "x": px,
-                "y": py,
-                "delay_before": _parse_seconds(step.get("delay_before", 0), "delay_before", i),
-                "wait_after": _parse_seconds(step.get("wait_after", 0), "wait_after", i),
-                "before_image": before_image,
-                "after_image": after_image,
-                "desc": "" if desc is None else str(desc).strip(),
-            })
-        else:
-            raise StepError(f"第 {i} 步类型未知: {stype!r}(支持 tap)")
+        def _img_field(field: str) -> str:
+            value = step.get(field, "")
+            if value is not None and not isinstance(value, str):
+                raise StepError(f"第 {i} 步 {field} 必须是字符串路径: {value!r}")
+            return (value or "").strip()
+
+        before_image = _img_field("before_image")
+        # 兼容旧脚本:expect_image 语义即 before_image
+        if not before_image:
+            before_image = _img_field("expect_image")
+        after_image = _img_field("after_image")
+        # 可选人类可读描述(GUI AI 模式保存步骤时附带的用户指令文本)
+        desc = step.get("desc")
+        item: Step = {
+            "type": stype,
+            "cell": cell,
+            "x": px,
+            "y": py,
+            "delay_before": _parse_seconds(step.get("delay_before", 0), "delay_before", i),
+            "wait_after": _parse_seconds(step.get("wait_after", 0), "wait_after", i),
+            "before_image": before_image,
+            "after_image": after_image,
+            "desc": "" if desc is None else str(desc).strip(),
+        }
+        if stype == "input":
+            text = step.get("text")
+            item["text"] = "" if text is None else str(text)
+            if not item["text"]:
+                raise StepError(f"第 {i} 步 input 必须提供 text(要输入的内容)")
+        normalized.append(item)
     return normalized
 
 
@@ -367,6 +374,7 @@ class StepRunner:
         steps: List[Step],
         on_event: Optional[EventCallback] = None,
         wait_tick: float = 0.2,
+        recorder: Optional[Any] = None,
     ) -> None:
         """
         顺序执行步骤列表。
@@ -383,6 +391,8 @@ class StepRunner:
             steps: 步骤列表(内部会再校验一次)。
             on_event: 进度回调 (当前步序号1基, 总步数, 消息文本)。
             wait_tick: 固定等待的心跳间隔(秒),用于倒计时刷新。
+            recorder: 可选录制器(recording.Recorder),传入后自动采集每步前后截图;
+                      异常时录制器也会收尾,再由本方法照常抛出异常。
 
         Raises:
             StepError: 步骤非法时抛出。
@@ -396,50 +406,80 @@ class StepRunner:
             if on_event is not None:
                 on_event(idx, total, msg)
 
-        for idx, step in enumerate(steps, 1):
-            if step["delay_before"] > 0:
-                emit(idx, f"执行前等待 {step['delay_before']:g} 秒…")
-                self._wait(step["delay_before"], idx, emit, wait_tick)
+        try:
+            for idx, step in enumerate(steps, 1):
+                if step["delay_before"] > 0:
+                    emit(idx, f"执行前等待 {step['delay_before']:g} 秒…")
+                    self._wait(step["delay_before"], idx, emit, wait_tick)
 
-            # 开始条件校验(仅告警)
-            if step["before_image"]:
-                self._check_start_condition(step["before_image"], idx, emit)
+                # 开始条件校验(仅告警)
+                if step["before_image"]:
+                    self._check_start_condition(step["before_image"], idx, emit)
 
-            cell = step["cell"]
-            # 精确像素坐标(AI 定位)优先;否则按格子编号换算
-            if step.get("x") is not None and step.get("y") is not None:
-                x, y = int(step["x"]), int(step["y"])
-            else:
-                x, y = self.marker.ref_to_point(cell, self.image_shape)
-            label = cell if cell else f"({x},{y})"
-            emit(idx, f"点击 {label} -> ({x}, {y})")
-            self._ensure_client().tap(x, y)
+                cell = step["cell"]
+                # 精确像素坐标(AI 定位)优先;否则按格子编号换算
+                if step.get("x") is not None and step.get("y") is not None:
+                    x, y = int(step["x"]), int(step["y"])
+                else:
+                    x, y = self.marker.ref_to_point(cell, self.image_shape)
+                label = cell if cell else f"({x},{y})"
+                client = self._ensure_client()
+                # 录制:动作前采集一帧
+                if recorder is not None:
+                    recorder.before_step(client, step, x, y)
 
-            # 完成条件:本步 after_image 优先,缺省链接到下一步的 before_image
-            next_step = steps[idx] if idx < total else None
-            target_rel = step["after_image"] or (
-                next_step["before_image"] if next_step else "")
-            target_path = self._resolve_expect_path(target_rel) if target_rel else ""
+                if step["type"] == "input":
+                    # 输入步骤:先点目标(聚焦输入框),再 adb 输入文本
+                    text = step["text"]
+                    emit(idx, f"输入 {label} -> ({x}, {y}),文本: {text!r}")
+                    client.tap(x, y)
+                    time.sleep(0.8)  # 等输入框聚焦/键盘弹出
+                    client.text(text)
+                else:
+                    emit(idx, f"点击 {label} -> ({x}, {y})")
+                    client.tap(x, y)
 
-            if target_path:
-                if not os.path.isfile(target_path):
-                    emit(idx, f"[告警] 执行后标准图不存在: {target_rel},退化为固定等待")
-                    target_path = ""
-                elif step["wait_after"] <= 0:
-                    emit(idx, "[告警] 配置了完成条件但 wait_after=0,无等待时间,跳过画面检查")
-                    target_path = ""
+                # 完成条件:本步 after_image 优先,缺省链接到下一步的 before_image
+                next_step = steps[idx] if idx < total else None
+                target_rel = step["after_image"] or (
+                    next_step["before_image"] if next_step else "")
+                target_path = self._resolve_expect_path(target_rel) if target_rel else ""
 
-            if target_path:
-                reached = self._wait_for_expected_screen(
-                    target_path, step["wait_after"], idx, emit)
-                if not reached:
-                    emit(idx, f"[告警] 等待 {step['wait_after']:g}s 后画面仍未到达执行后标准图,"
-                              f"可能未跳转成功,继续执行下一步")
-            elif step["wait_after"] > 0:
-                emit(idx, f"执行后等待 {step['wait_after']:g} 秒…")
-                self._wait(step["wait_after"], idx, emit, wait_tick)
+                if target_path:
+                    if not os.path.isfile(target_path):
+                        emit(idx, f"[告警] 执行后标准图不存在: {target_rel},退化为固定等待")
+                        target_path = ""
+                    elif step["wait_after"] <= 0:
+                        emit(idx, "[告警] 配置了完成条件但 wait_after=0,无等待时间,跳过画面检查")
+                        target_path = ""
 
-        emit(total, "全部步骤执行完成")
+                if target_path:
+                    reached = self._wait_for_expected_screen(
+                        target_path, step["wait_after"], idx, emit)
+                    if not reached:
+                        emit(idx, f"[告警] 等待 {step['wait_after']:g}s 后画面仍未到达执行后标准图,"
+                                  f"可能未跳转成功,继续执行下一步")
+                elif step["wait_after"] > 0:
+                    emit(idx, f"执行后等待 {step['wait_after']:g} 秒…")
+                    self._wait(step["wait_after"], idx, emit, wait_tick)
+
+                # 录制:等待结束后采集一帧
+                if recorder is not None:
+                    recorder.after_step(client, step)
+
+            emit(total, "全部步骤执行完成")
+        except BaseException as exc:
+            # 异常时先收尾录制,再照常抛出(不吞异常)
+            if recorder is not None:
+                try:
+                    recorder.fail(exc)
+                    recorder.finish("failed")
+                except Exception:
+                    logger.exception("[StepRunner] 录制器异常收尾失败(忽略)")
+            raise
+        else:
+            if recorder is not None:
+                recorder.finish("finished")
 
 
 __all__ = ["StepRunner", "StepError", "validate_steps", "load_steps", "save_steps"]

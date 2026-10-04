@@ -14,7 +14,16 @@ from typing import List, Tuple
 
 import cv2
 import numpy as np
-from rapidfuzz import fuzz
+
+try:
+    from rapidfuzz import fuzz
+except ImportError:  # rapidfuzz 缺失时用标准库 difflib 兜底(精度略低,行为一致)
+    import difflib
+
+    class fuzz:  # noqa: N801  模拟 rapidfuzz.fuzz 接口
+        @staticmethod
+        def ratio(a: str, b: str) -> float:
+            return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
 
 import cvio  # noqa: F401  项目约定:图像读写统一走 cvio(兼容中文路径)
 

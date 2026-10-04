@@ -21,5 +21,10 @@ runner/device_id.txt
 # GUI 未保存草稿(运行时数据)
 runner/scripts/untitled/
 
+# 本地 Python 依赖目录(平台相关,不入库)
+_deps/
+# 完整运行的录制产物(帧序列/replay.mp4,运行期数据)
+runner/runs/
+
 # 本地冒烟测试脚本
 _smoke_test.py

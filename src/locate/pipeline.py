@@ -170,6 +170,7 @@ def locate(
         query=query,
         candidates=candidates,
         top_candidates=ranked,
+        intent=intent,
     )
     logger.info("定位完成: point=%s, cell=%s, conf=%.2f, sources=%s",
                 result.point, result.grid_cell, result.confidence, result.sources)

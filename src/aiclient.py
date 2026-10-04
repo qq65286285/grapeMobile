@@ -32,6 +32,37 @@ DEFAULT_MODEL = "agnes-3.0-flash"
 DEFAULT_TIMEOUT = 120  # 秒(vision 请求图片大,需留足时间)
 DEFAULT_MAX_TOKENS = 2048
 
+# 追踪钩子:赋值为 fn(msg: str) 后,每次 AI 调用的请求摘要与回复全文都会回调,
+# 供 GUI 等界面展示 AI 的思考过程;默认 None(不追踪)。回调内异常被静默忽略。
+trace = None
+
+
+def _emit_trace(msg: str) -> None:
+    fn = trace
+    if fn is None:
+        return
+    try:
+        fn(msg)
+    except Exception:
+        pass
+
+
+def _summarize_messages(messages: List[Dict[str, Any]], limit: int = 800) -> str:
+    """把 chat messages 压成可读摘要(vision 图片只标记 [截图],不展开 base64)。"""
+    parts = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            texts = [str(c.get("text", "")) for c in content
+                     if isinstance(c, dict) and c.get("type") == "text"]
+            if any(isinstance(c, dict) and c.get("type") == "image_url" for c in content):
+                texts.append("[截图]")
+            content = " ".join(t for t in texts if t)
+        parts.append(f"{role}: {content}")
+    out = "\n".join(parts)
+    return out if len(out) <= limit else out[:limit] + " …(截断)"
+
 
 class AIError(Exception):
     """AI API 调用异常。"""
@@ -75,21 +106,27 @@ class AIClient:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
+        _emit_trace(f"[AI] 请求 → {self.model}\n{_summarize_messages(messages)}")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            _emit_trace(f"[AI] 请求失败: HTTP {exc.code} {detail}")
             raise AIError(f"API 返回 HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
+            _emit_trace(f"[AI] 请求失败: {exc.reason}")
             raise AIError(f"网络请求失败: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
             raise AIError(f"响应 JSON 解析失败: {exc}") from exc
 
         try:
-            return body["choices"][0]["message"]["content"]
+            content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as exc:
             raise AIError(f"响应结构异常: {body}") from exc
+        reply = content if len(content) <= 1500 else content[:1500] + " …(截断)"
+        _emit_trace(f"[AI] 回复:\n{reply}")
+        return content
 
     # ------------------------------------------------------------------
     # 图片编码工具

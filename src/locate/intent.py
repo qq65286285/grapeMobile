@@ -31,6 +31,40 @@ _CJK_RE = re.compile(r'[\u4e00-\u9fa5]+')
 _ICON_KEYWORDS = ("图标", "icon")
 _BUTTON_KEYWORDS = ("按钮", "button")
 
+# 输入/填写意图关键词(中英)
+_INPUT_KEYWORDS = ("输入", "填写", "键入", "录入", "type", "enter", "input")
+_INPUT_INTENT_RE = re.compile(
+    r"输入|填写|键入|录入|\btype\b|\benter\b|\binput\b", re.IGNORECASE)
+# 句型 A: 在/到/向 <目标> (中/里) 输入 <文本>
+_INPUT_AFTER_TARGET_RE = re.compile(
+    r"(?:在|到|向)\s*[\"“”‘’']?\s*(?P<target>.+?)\s*[\"“”‘’']?\s*(?:中|里|内)?\s*"
+    r"(?:输入|填写|键入|录入)\s*[\"“”‘’']?\s*(?P<text>.+?)\s*[\"“”‘’']?\s*$")
+# 句型 B: 输入 <文本> 到/在/向 <目标>
+_INPUT_BEFORE_TARGET_RE = re.compile(
+    r"(?:输入|填写|键入|录入)\s*[\"“”‘’']?\s*(?P<text>.+?)\s*[\"“”‘’']?\s*"
+    r"(?:到|在|向)\s*[\"“”‘’']?\s*(?P<target>.+?)\s*[\"“”‘’']?\s*$")
+
+
+def _parse_input_action(query: str):
+    """
+    检测"输入文字"意图并拆出 (目标框描述, 待输入文本)。
+
+    Returns:
+        (target_text, input_text) 或 None(非输入意图/拆不出目标)。
+    """
+    if not query or not _INPUT_INTENT_RE.search(query):
+        return None
+    for pattern in (_INPUT_AFTER_TARGET_RE, _INPUT_BEFORE_TARGET_RE):
+        m = pattern.search(query)
+        if not m:
+            continue
+        target = m.group("target").strip().strip("\"“”‘’' ")
+        text = m.group("text").strip().strip("\"“”‘’' ")
+        # 目标需含中文或字母(避免把纯标点当目标);文本非空
+        if target and text and re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", target):
+            return target, text
+    return None
+
 # 应被过滤的非目标词(动词、方位、颜色、UI 类目、虚词等)
 _STOP_WORDS = {
     # 方位
@@ -44,12 +78,14 @@ _STOP_WORDS = {
     "点击", "点一下", "请点击", "找", "找到", "按", "敲", "选择", "进入",
     "打开", "关闭", "触发", "一下", "那个", "这个", "的", "位于", "处于", "在",
     "帮我", "给我", "我要", "想要",
+    "输入", "填写", "键入", "录入",
     # UI 类目词(不是专名)
     "按钮", "图标", "菜单", "菜单项", "项", "链接", "图片", "图像",
     "标签", "选项", "选项卡", "栏", "条",
     # 英文常见词
     "click", "tap", "press", "the", "a", "an", "of", "on", "at",
     "icon", "button", "menu", "item", "link", "image", "label",
+    "type", "enter", "input",
     "top", "bottom", "left", "right", "corner", "red", "blue",
     "green", "yellow", "black", "white",
 }
@@ -178,10 +214,13 @@ def _regex_extract(query: str) -> str:
 # LLM 兜底
 # --------------------------------------------------------------------
 _LLM_SYSTEM = (
-    "你是 Android UI 自动化的意图解析器。从用户输入中提取要点击的 UI 元素信息。"
+    "你是 Android UI 自动化的意图解析器。从用户输入中提取要操作的 UI 元素信息。"
     "只输出严格 JSON,不要任何解释或代码块标记。格式:"
-    '{"target_text":"提取的目标文字","target_type":"icon_with_label|text|icon|other","visual_hint":"外观提示简述"}'
-    "。target_type 取值:带文字标签的图标用 icon_with_label;"
+    '{"action":"tap|input","target_text":"提取的目标文字","input_text":"要输入的文本",'
+    '"target_type":"icon_with_label|text|icon|other","visual_hint":"外观提示简述"}'
+    "。action:用户要点击元素用 tap;要在输入框/搜索框等输入文字用 input"
+    "(此时 target_text 填输入框的描述文字,input_text 填要输入的内容,无输入内容时留空)。"
+    "target_type 取值:带文字标签的图标用 icon_with_label;"
     "纯文字(按钮/链接/菜单项)用 text;"
     "无文字的纯图标用 icon;无法判断用 other。"
     "若用户未指定具体文字,target_text 留空字符串。"
@@ -215,12 +254,18 @@ def _parse_via_llm(query: str, ai_client) -> Optional[Intent]:
     if target_type not in ("icon_with_label", "text", "icon", "other"):
         target_type = "other"
     visual_hint = str(data.get("visual_hint", "") or "").strip()
+    action = str(data.get("action", "tap") or "").strip().lower()
+    if action not in ("tap", "input"):
+        action = "tap"
+    input_text = str(data.get("input_text", "") or "").strip()
 
     return Intent(
         target_text=target_text,
         target_type=target_type,
         visual_hint=visual_hint,
         raw_query=query,
+        action=action,
+        input_text=input_text,
     )
 
 
@@ -232,14 +277,30 @@ def parse_intent(query: str, ai_client=None) -> Intent:
     从用户自然语言描述中解析定位意图。
 
     Args:
-        query: 用户原始描述(如 "点击左上角的 KOF:Legend 图标")。
+        query: 用户原始描述(如 "点击左上角的 KOF:Legend 图标"、
+               "在搜索框输入 hello")。
         ai_client: 可选 AIClient 实例。正则提取不到目标文字时,
                    用一次纯文本 LLM 调用兜底解析。
 
     Returns:
-        Intent(target_text, target_type, visual_hint, raw_query)
+        Intent(target_text, target_type, visual_hint, raw_query, action, input_text)
     """
     raw = (query or "").strip()
+
+    # 输入意图优先:正则直接拆出 目标框 + 待输入文本
+    # (若走通用提取,"输入hello"里的 hello 会被误当成定位目标)
+    input_hit = _parse_input_action(raw)
+    if input_hit is not None:
+        target_text, input_text = input_hit
+        return Intent(
+            target_text=target_text,
+            target_type=_heuristic_type(raw, target_text),
+            visual_hint=_extract_visual_hint(raw, target_text),
+            raw_query=raw,
+            action="input",
+            input_text=input_text,
+        )
+
     target_text = _regex_extract(raw)
     target_type = _heuristic_type(raw, target_text)
     visual_hint = _extract_visual_hint(raw, target_text)
@@ -249,7 +310,7 @@ def parse_intent(query: str, ai_client=None) -> Intent:
         try:
             llm_intent = _parse_via_llm(raw, ai_client)
             if llm_intent is not None:
-                # 信任 LLM 的解析(含其给出的 target_type)
+                # 信任 LLM 的解析(含其给出的 target_type/action/input_text)
                 return llm_intent
             # LLM 返回 None(解析失败)→ 退化为 other
             target_type = "other"
