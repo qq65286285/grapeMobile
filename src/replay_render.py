@@ -315,6 +315,77 @@ def _render_tap_event(
         yield fr
 
 
+# ── 非 UI 事件(App 生命周期/系统按键)──────────────
+_SYSTEM_LABELS = {
+    "app_stop": "关闭 App",
+    "app_start": "启动 App",
+    "app_clear": "清除 App 数据",
+}
+_KEY_LABELS = {"home": "Home 键", "back": "返回键", "recents": "最近任务键"}
+
+
+def _system_subtitle(ev: Dict[str, Any]) -> str:
+    """非 UI 事件字幕:优先描述,否则动作+包名/按键。"""
+    desc = str(ev.get("desc", "") or "").strip()
+    if desc:
+        return desc
+    etype = ev.get("type")
+    if etype == "keyevent":
+        key = str(ev.get("key", "") or "")
+        return f"系统按键: {_KEY_LABELS.get(key, key)}"
+    pkg = str(ev.get("package", "") or "").strip()
+    action = _SYSTEM_LABELS.get(etype, str(etype))
+    return f"{action}: {pkg}" if pkg else action
+
+
+def _render_system_event(
+    ev: Dict[str, Any], store: _FrameStore, canvas: Tuple[int, int]
+) -> Iterator[np.ndarray]:
+    """渲染非 UI 事件:前画面静止 -> crossfade -> 后画面静止,无触控波纹。"""
+    before_img = store.get(ev.get("before"))
+    after_img = store.get(ev.get("after"))
+    subtitle = _system_subtitle(ev)
+
+    # 执行失败:红条停留
+    if ev.get("status") == "failed":
+        base = before_img if before_img is not None else _black(canvas)
+        for _ in range(FAIL_HOLD_FRAMES):
+            fr = base.copy()
+            draw_subtitle(fr, f"执行失败: {ev.get('error') or subtitle}",
+                          color_bgr=(70, 70, 255))
+            yield fr
+        return
+
+    if before_img is None and after_img is None:
+        for _ in range(HOLD_BEFORE_FRAMES + HOLD_AFTER_FRAMES):
+            yield _black(canvas)
+        return
+    if before_img is None:
+        before_img = after_img
+    if after_img is None:
+        after_img = before_img
+
+    # 1. 执行前静止
+    for _ in range(HOLD_BEFORE_FRAMES):
+        fr = before_img.copy()
+        draw_subtitle(fr, subtitle)
+        yield fr
+
+    # 2. 新旧画面 crossfade(画面无变化时跳过)
+    if after_img is not before_img:
+        for i in range(CROSSFADE_FRAMES):
+            t = i / (CROSSFADE_FRAMES - 1)
+            fr = cv2.addWeighted(after_img, t, before_img, 1 - t, 0)
+            draw_subtitle(fr, subtitle)
+            yield fr
+
+    # 3. 执行后静止
+    for _ in range(HOLD_AFTER_FRAMES):
+        fr = after_img.copy()
+        draw_subtitle(fr, subtitle)
+        yield fr
+
+
 def _black(canvas: Tuple[int, int]) -> np.ndarray:
     return np.zeros((canvas[1], canvas[0], 3), dtype=np.uint8)
 
@@ -338,8 +409,11 @@ def render_frames(recording: Dict[str, Any]) -> Iterator[np.ndarray]:
     store = _FrameStore(base_dir, canvas)
 
     for ev in recording["events"]:
-        if ev.get("type") in ("tap", "error"):
+        etype = ev.get("type")
+        if etype in ("tap", "input", "error"):
             yield from _render_tap_event(ev, store, canvas)
+        elif etype in ("app_stop", "app_start", "app_clear", "keyevent"):
+            yield from _render_system_event(ev, store, canvas)
 
     # 结尾黑场
     for _ in range(END_FRAMES):

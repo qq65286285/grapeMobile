@@ -61,6 +61,22 @@ DEFAULT_EXPECT_THRESHOLD = 0.92
 # 轮询截图的最小间隔(秒);adb 截图本身有耗时,这是两次截图之间的额外间隔
 DEFAULT_POLL_INTERVAL = 0.5
 
+# ---- 非 UI 步骤(不依赖画面定位):App 生命周期 + 系统按键 ----
+# app_stop: 强制关闭 App(am force-stop)
+# app_start: 启动 App(monkey LAUNCHER)
+# app_clear: 清除 App 数据(pm clear)
+# keyevent: 发送系统按键
+APP_OP_TYPES = ("app_stop", "app_start", "app_clear")
+KEYEVENT_STEP_TYPE = "keyevent"
+NON_UI_STEP_TYPES = frozenset(APP_OP_TYPES + (KEYEVENT_STEP_TYPE,))
+# keyevent 可选按键(脚本里写短名) -> Android KEYCODE
+KEYEVENT_MAP = {
+    "home": "KEYCODE_HOME",
+    "back": "KEYCODE_BACK",
+    "recents": "KEYCODE_APP_SWITCH",
+}
+KEYEVENT_LABELS = {"home": "Home 键", "back": "返回键", "recents": "最近任务键"}
+
 
 class StepError(Exception):
     """步骤定义非法或执行环境缺失(设备/网格产物)时抛出。"""
@@ -90,6 +106,14 @@ def validate_steps(steps: Any) -> List[Step]:
         text:         input 步骤专用:要输入的文本(仅支持英文/数字,中文受限)。
     旧字段 expect_image 等价于 before_image(仅加载兼容,保存时不再写出)。
 
+    App 外操作(非 UI 步骤,无需格子/锚点):
+        {"type": "app_stop", "package": ""}   关闭 App;package 留空 = 执行时
+                                             自动识别当前前台 App
+        {"type": "app_start", "package": "com.xxx"}  启动 App
+        {"type": "app_clear", "package": "com.xxx"}  清除 App 数据
+        {"type": "keyevent", "key": "home"}   系统按键:home/back/recents
+    非 UI 步骤同样支持 delay_before/wait_after/desc。
+
     Raises:
         StepError: 结构非法(类型未知/格子编号非法/秒数非法等)时抛出。
 
@@ -103,8 +127,52 @@ def validate_steps(steps: Any) -> List[Step]:
         if not isinstance(step, dict):
             raise StepError(f"第 {i} 步必须是对象,实际: {step!r}")
         stype = step.get("type")
-        if stype not in ("tap", "input"):
-            raise StepError(f"第 {i} 步类型未知: {stype!r}(支持 tap/input)")
+        if stype not in ("tap", "input") + APP_OP_TYPES + (KEYEVENT_STEP_TYPE,):
+            raise StepError(
+                f"第 {i} 步类型未知: {stype!r}"
+                f"(支持 tap/input/{'/'.join(APP_OP_TYPES)}/{KEYEVENT_STEP_TYPE})")
+
+        # 非 UI 步骤:无格子/坐标/锚点,只需时间字段 + 类型专有字段
+        if stype in APP_OP_TYPES:
+            package = step.get("package", "")
+            if package is not None and not isinstance(package, str):
+                raise StepError(f"第 {i} 步 package 必须是字符串: {package!r}")
+            normalized.append({
+                "type": stype,
+                "cell": "",
+                "x": None,
+                "y": None,
+                "delay_before": _parse_seconds(step.get("delay_before", 0),
+                                               "delay_before", i),
+                "wait_after": _parse_seconds(step.get("wait_after", 0),
+                                             "wait_after", i),
+                "before_image": "",
+                "after_image": "",
+                "desc": str(step.get("desc") or "").strip(),
+                "package": (package or "").strip(),
+            })
+            continue
+        if stype == KEYEVENT_STEP_TYPE:
+            key = str(step.get("key", "")).strip().lower()
+            if key not in KEYEVENT_MAP:
+                raise StepError(
+                    f"第 {i} 步 keyevent 的 key 必须是 "
+                    f"{'/'.join(KEYEVENT_MAP)} 之一: {key!r}")
+            normalized.append({
+                "type": stype,
+                "cell": "",
+                "x": None,
+                "y": None,
+                "delay_before": _parse_seconds(step.get("delay_before", 0),
+                                               "delay_before", i),
+                "wait_after": _parse_seconds(step.get("wait_after", 0),
+                                             "wait_after", i),
+                "before_image": "",
+                "after_image": "",
+                "desc": str(step.get("desc") or "").strip(),
+                "key": key,
+            })
+            continue
 
         cell = str(step.get("cell", "")).strip().upper()
 
@@ -369,6 +437,35 @@ class StepRunner:
             except OSError:
                 pass
 
+    def _execute_non_ui_step(
+        self,
+        client: Any,
+        step: Step,
+        idx: int,
+        emit: Callable[[int, str], None],
+    ) -> None:
+        """执行一个非 UI 步骤:App 生命周期(app_*)或系统按键(keyevent)。"""
+        stype = step["type"]
+        if stype == KEYEVENT_STEP_TYPE:
+            key = step["key"]
+            emit(idx, f"发送{KEYEVENT_LABELS[key]}: {KEYEVENT_MAP[key]}")
+            client.keyevent(KEYEVENT_MAP[key])
+            return
+        # App 操作:package 留空则执行瞬间识别当前前台 App
+        pkg = step.get("package") or ""
+        if not pkg:
+            pkg = client.current_package()
+            emit(idx, f"自动识别当前前台 App: {pkg}")
+        if stype == "app_stop":
+            emit(idx, f"关闭 App: {pkg}")
+            client.force_stop(pkg)
+        elif stype == "app_start":
+            emit(idx, f"启动 App: {pkg}")
+            client.launch_app(pkg)
+        else:  # app_clear
+            emit(idx, f"清除 App 数据: {pkg}")
+            client.clear_app(pkg)
+
     def run(
         self,
         steps: List[Step],
@@ -379,13 +476,15 @@ class StepRunner:
         """
         顺序执行步骤列表。
 
-        每步:
+        UI 步骤(tap/input)每步:
           1. delay_before 固定等待;
           2. 若配了 before_image,截图校验"开始条件"(不满足只告警,不阻断);
           3. 点击格子;
           4. 等待"完成条件":优先用本步 after_image,缺省则用下一步 before_image;
              轮询截图比对(超时上限 wait_after),到达立即继续,超时告警后继续;
              两者都没有时退化为固定等待 wait_after 秒。
+        非 UI 步骤(app_stop/app_start/app_clear/keyevent)跳过 2~3 与锚点等待,
+        只执行 delay_before -> 系统操作 -> wait_after 固定等待。
 
         Args:
             steps: 步骤列表(内部会再校验一次)。
@@ -411,6 +510,19 @@ class StepRunner:
                 if step["delay_before"] > 0:
                     emit(idx, f"执行前等待 {step['delay_before']:g} 秒…")
                     self._wait(step["delay_before"], idx, emit, wait_tick)
+
+                # 非 UI 步骤(App 生命周期/系统按键):无坐标与锚点,走独立分支
+                if step["type"] in NON_UI_STEP_TYPES:
+                    client = self._ensure_client()
+                    if recorder is not None:
+                        recorder.before_step(client, step, 0, 0)
+                    self._execute_non_ui_step(client, step, idx, emit)
+                    if step["wait_after"] > 0:
+                        emit(idx, f"执行后等待 {step['wait_after']:g} 秒…")
+                        self._wait(step["wait_after"], idx, emit, wait_tick)
+                    if recorder is not None:
+                        recorder.after_step(client, step)
+                    continue
 
                 # 开始条件校验(仅告警)
                 if step["before_image"]:

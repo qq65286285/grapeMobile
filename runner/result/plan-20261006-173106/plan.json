@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "plan_id": "plan-20261006-173106",
+  "created_at": 1791279067.562646,
+  "created_str": "2026-10-06 17:31:07",
+  "device_id": "emulator-5554",
+  "cases": [
+    {
+      "name": "kof 邮箱登录 柬埔寨包",
+      "path": "kof 邮箱登录 柬埔寨包\\kof 邮箱登录 柬埔寨包.json",
+      "status": "failed",
+      "error": "StepApp._make_exec_event.<locals>.emit() takes 2 positional arguments but 3 were given",
+      "duration_sec": 0.8,
+      "recording": "kof 邮箱登录 柬埔寨包\\recording.json",
+      "replay": ""
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "run_id": "kof 邮箱登录 柬埔寨包",
+  "created_at": 1791279066.750543,
+  "device_id": "emulator-5554",
+  "fps": 30,
+  "canvas_width": 720,
+  "status": "failed",
+  "event_count": 1,
+  "events": [
+    {
+      "type": "error",
+      "index": 1,
+      "desc": "",
+      "status": "failed",
+      "error": "StepApp._make_exec_event.<locals>.emit() takes 2 positional arguments but 3 were given"
+    }
+  ]
+}

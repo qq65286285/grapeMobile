@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -296,6 +297,94 @@ class AdbClient:
         escaped = "'" + escaped.replace("'", "'\\''") + "'"
         logger.info("[AdbClient] 输入文本 (%d 字符) @ %s", len(text), self.device_id)
         self._run(["shell", "input", "text", escaped], timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # App 外操作(不依赖 App 内画面:App 生命周期 / 系统按键)
+    # ------------------------------------------------------------------
+    def force_stop(self, package: str, timeout: float = 15.0) -> None:
+        """
+        强制关闭 App:adb shell am force-stop <包名>(杀进程,不弹确认)。
+
+        Raises:
+            AdbError: 未连接设备或命令失败。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        logger.info("[AdbClient] 关闭 App: %s @ %s", package, self.device_id)
+        self._run(["shell", "am", "force-stop", package], timeout=timeout)
+
+    def clear_app(self, package: str, timeout: float = 20.0) -> None:
+        """
+        清除 App 全部数据(等同设置里的"清除数据"):adb shell pm clear <包名>。
+
+        Raises:
+            AdbError: 未连接设备 / 命令失败 / 包名不存在(设备返回非 Success)。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        logger.info("[AdbClient] 清除 App 数据: %s @ %s", package, self.device_id)
+        result = self._run(["shell", "pm", "clear", package], timeout=timeout)
+        if "Success" not in (result.stdout or ""):
+            raise AdbError(f"pm clear {package} 未成功,设备输出: "
+                           f"{(result.stdout or '').strip()!r}(检查包名是否正确)")
+
+    def launch_app(self, package: str, timeout: float = 20.0) -> None:
+        """
+        启动 App 到前台:adb shell monkey -p <包名> -c android.intent.category.LAUNCHER 1。
+
+        Raises:
+            AdbError: 未连接设备 / 命令失败 / 包名无启动入口。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        logger.info("[AdbClient] 启动 App: %s @ %s", package, self.device_id)
+        result = self._run(
+            ["shell", "monkey", "-p", package,
+             "-c", "android.intent.category.LAUNCHER", "1"],
+            timeout=timeout)
+        out = result.stdout or ""
+        # 包名不存在/无 LAUNCHER 入口时 monkey 输出 "No activities found"
+        if "No activities found" in out:
+            raise AdbError(f"启动失败,找不到 {package} 的启动入口:\n{out.strip()}")
+
+    def keyevent(self, keycode: str, timeout: float = 10.0) -> None:
+        """
+        发送系统按键:adb shell input keyevent <keycode>。
+
+        Args:
+            keycode: 键名(如 KEYCODE_HOME)或数字码。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        logger.info("[AdbClient] 按键: %s @ %s", keycode, self.device_id)
+        self._run(["shell", "input", "keyevent", str(keycode)], timeout=timeout)
+
+    def current_package(self, timeout: float = 10.0) -> str:
+        """
+        识别当前前台 App 的包名(无需知道包名即可录制"关闭当前 App")。
+
+        依次解析:
+            1. dumpsys window 的 mCurrentFocus(当前焦点窗口);
+            2. 同输出的 mFocusedApp(焦点所属 App);
+            3. dumpsys activity activities 的 mResumedActivity(旧版本兜底)。
+
+        Raises:
+            AdbError: 无法从设备输出中解析出包名。
+        """
+        if not self.device_id:
+            raise AdbError("尚未连接设备,请先调用 connect() 或 attach()")
+        win_out = self._run(["shell", "dumpsys", "window"], timeout=timeout).stdout or ""
+        # 形如: mCurrentFocus=Window{... u0 com.garena.game.kcmjp/com.unity...Activity}
+        for tag in ("mCurrentFocus", "mFocusedApp"):
+            m = re.search(tag + r"[^\n]*? ([a-zA-Z][\w.]*)/[\w.$]", win_out)
+            if m:
+                return m.group(1)
+        act_out = self._run(
+            ["shell", "dumpsys", "activity", "activities"], timeout=timeout).stdout or ""
+        m = re.search(r"mResumedActivity[^\n]*? ([a-zA-Z][\w.]*)/[\w.$]", act_out)
+        if m:
+            return m.group(1)
+        raise AdbError("无法识别当前前台 App 包名(dumpsys 输出中无焦点窗口信息)")
 
     # ------------------------------------------------------------------
     # 内部工具

@@ -172,8 +172,10 @@ class Recorder:
             x, y: 本步实际点击的像素坐标。
         """
         before = self.capture_frame(client)
+        # 事件类型跟步骤走:tap / input / app_stop / app_start / app_clear / keyevent
+        # (回放据此决定是否画点击标记)
         self._current = {
-            "type": "tap",
+            "type": str(step.get("type", "tap")),
             "index": len(self._events) + 1,
             "desc": str(step.get("desc", "") or ""),
             "x": int(x),
@@ -183,6 +185,9 @@ class Recorder:
             "status": "pending",
             "error": None,
             "wait_after": float(step.get("wait_after", 0) or 0),
+            # 非 UI 步骤专有参数(回放叠加文字用)
+            "package": str(step.get("package", "") or ""),
+            "key": str(step.get("key", "") or ""),
         }
 
     def after_step(self, client: Any, _step: Dict[str, Any]) -> None:

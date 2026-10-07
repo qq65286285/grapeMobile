@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "run_id": "kof 邮箱登录 柬埔寨包",
+  "created_at": 1791279132.4261038,
+  "device_id": "emulator-5554",
+  "fps": 30,
+  "canvas_width": 720,
+  "status": "finished",
+  "event_count": 6,
+  "events": [
+    {
+      "type": "tap",
+      "index": 1,
+      "desc": "点击kof legend",
+      "x": 684,
+      "y": 271,
+      "before": {
+        "frame": "frames/00001.jpg",
+        "width": 1600,
+        "height": 900
+      },
+      "after": {
+        "frame": "frames/00002.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 30.0
+    },
+    {
+      "type": "tap",
+      "index": 2,
+      "desc": "点击中间弹框下面的them tai khoan ，中文意思为 登录新账户",
+      "x": 450,
+      "y": 952,
+      "before": {
+        "frame": "frames/00003.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "after": {
+        "frame": "frames/00004.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 10.0
+    },
+    {
+      "type": "tap",
+      "index": 3,
+      "desc": "点击email",
+      "x": 290,
+      "y": 876,
+      "before": {
+        "frame": "frames/00005.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "after": {
+        "frame": "frames/00006.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 10.0
+    },
+    {
+      "type": "tap",
+      "index": 4,
+      "desc": "找到nhap dia chi email这个文本框，在里面输入65286285@qq.com",
+      "x": 258,
+      "y": 781,
+      "before": {
+        "frame": "frames/00007.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "after": {
+        "frame": "frames/00008.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 10.0
+    },
+    {
+      "type": "tap",
+      "index": 5,
+      "desc": "[用户] 找到在文本框 ma xac minh ，在里面输入000000",
+      "x": 346,
+      "y": 891,
+      "before": {
+        "frame": "frames/00009.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "after": {
+        "frame": "frames/00010.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 10.0
+    },
+    {
+      "type": "tap",
+      "index": 6,
+      "desc": "点击按钮：dang nhap ，中文意思为登录",
+      "x": 449,
+      "y": 1018,
+      "before": {
+        "frame": "frames/00011.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "after": {
+        "frame": "frames/00012.jpg",
+        "width": 900,
+        "height": 1600
+      },
+      "status": "finished",
+      "error": null,
+      "wait_after": 10.0
+    }
+  ]
+}

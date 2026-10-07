@@ -29,9 +29,11 @@ runner/gui_steps.py - 步骤编排可视化界面(Tkinter)
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import threading
@@ -42,6 +44,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageTk
 
 # 将 src/ 加入 sys.path(与其他 runner 脚本一致)
 _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
@@ -55,7 +58,10 @@ if os.path.isdir(_DEPS_DIR):
 import cvio  # noqa: E402  Unicode 路径兼容的图像读写(中文脚本名目录)
 import aiclient  # noqa: E402  AI 调用客户端(trace 钩子用于展示 AI 思考过程)
 from grid import GridMarker, col_name  # noqa: E402
-from steps import StepError, StepRunner, load_steps, save_steps  # noqa: E402
+from steps import (  # noqa: E402
+    APP_OP_TYPES, KEYEVENT_LABELS, KEYEVENT_MAP,
+    StepError, StepRunner, load_steps, save_steps,
+)
 from adbtools import AdbClient, AdbError  # noqa: E402
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,15 +74,161 @@ DEVICE_ID_FILE = os.path.join(_BASE_DIR, "device_id.txt")
 #   runner/scripts/steps-1/steps-1.json
 #   runner/scripts/steps-1/images/0001.png   (录制时保存的点击前画面)
 SCRIPTS_DIR = os.path.join(_BASE_DIR, "scripts")
+# 执行模式结果根目录:每次执行勾选用例生成一个测试计划子目录 result/<plan-id>/,
+# 内含 plan.json(计划汇总)+ 每条用例一个子目录(recording.json / frames/ / replay.mp4)
+RESULT_DIR = os.path.join(_BASE_DIR, "result")
 # 新建脚本未保存前使用的临时脚本名(锚点先存到 scripts/untitled/images/,保存时迁移)
 DRAFT_SCRIPT_NAME = "untitled"
 DEFAULT_CELL_SIZE = 30  # 实时截图生成网格时的默认格子边长(像素)
 MARGIN = 40  # 与 GridMarker 默认边距一致(网格图在原图四周外扩 40px)
-MAX_DISPLAY_WIDTH = 780   # 左侧网格图显示区域最大宽度(像素)
-MAX_DISPLAY_HEIGHT = 900  # 最大高度(像素),竖屏截图缩放到屏幕能放下
+MAX_DISPLAY_WIDTH = 288   # 设备画面(左栏,宽320)网格图显示区域最大宽度(像素)
+MAX_DISPLAY_HEIGHT = 480  # 最大高度(像素),竖屏截图按三栏600高缩放适配
 # 右侧"预期画面"缩略图尺寸(锚点是全屏截图,before/after 各一张)
 EXPECT_IMG_W = 168
 EXPECT_IMG_H = 150
+
+# ---------------------------------------------------------------------------
+# 暗色主题(克制版:单一葡萄紫强调色,无霓虹/渐变)
+# 视觉定调参照 IDE / 开发者工具暗色(VS Code、GitHub Dark、DevTools),
+# 长时间盯截图与日志不刺眼;状态色用中性工程色,图标保持线性/文字。
+# ---------------------------------------------------------------------------
+THEME = {
+    "bg":        "#0f1115",  # 主背景
+    "bg2":       "#161922",  # 次背景(顶栏/右栏/卡片底,对应 v3 --bg2)
+    "surface":   "#1a1d24",  # 表面 / 面板
+    "surface2":  "#21262d",  # 输入框 / 次级表面
+    "border":    "#262b33",  # 弱边框
+    "border2":   "#323842",  # 较强边框 / 描边
+    "txt":       "#e6e9ef",  # 主文字
+    "txt2":      "#9aa3b0",  # 次要文字
+    "txt3":      "#6b7280",  # 最弱文字(区块小标题/占位说明)
+    "accent":    "#7c6cd9",  # 葡萄紫强调色(唯一强调色)
+    "accent_bg": "#272242",  # 强调底色(按钮 hover / 选中态)
+    "accent_soft": "#322c52",  # 强调软底色(选中卡片底,对应 v3 accent-soft)
+    "green":     "#3fb950",  # 在线 / 成功
+    "red":       "#f85149",  # 错误 / 离线
+    "term_bg":   "#0b0d10",  # 终端日志底
+    "term_fg":   "#8b9586",  # 终端日志字
+    "row_alt":   "#161920",  # 列表斑马纹(偶数行)
+    "chat_ai":   "#8ab4f8",  # AI 对话消息(AI 侧)
+    "chat_user": "#7dcf8a",  # AI 对话消息(用户侧)
+    "bubble_ai":     "#2b303b",  # AI 气泡底(需与 bg 明显区分,否则截图上看不见)
+    "bubble_user":   "#4a3f7d",  # 用户气泡底(紫调)
+    "bubble_border": "#3d4450",  # 气泡描边
+    "bubble_sys_bg": "#1a1d24",  # 系统提示条底
+}
+
+# 字体系统:UI 用微软雅黑(中文渲染干净),坐标/日志用 Consolas 等宽
+# 字号对齐设计稿:正文 11pt / 小标题与列表 10pt(Windows 下 pt 偏小,比 CSS px 视觉更大)
+FONT_UI = ("Microsoft YaHei UI", 11)
+FONT_UI_BOLD = ("Microsoft YaHei UI", 11, "bold")
+FONT_BTN = ("Microsoft YaHei UI", 10)          # 按钮/输入框(≈设计稿 13px)
+FONT_BTN_BOLD = ("Microsoft YaHei UI", 10, "bold")
+FONT_CAPTION = ("Microsoft YaHei UI", 10)         # 区块小标题(次要色)
+FONT_LIST = ("Microsoft YaHei UI", 10)            # 步骤列表行
+FONT_MONO = ("Consolas", 10)                       # 日志
+FONT_MONO_CHAT = ("Consolas", 10)                 # AI 对话
+FONT_BUBBLE = ("Microsoft YaHei UI", 11)          # 对话气泡正文
+FONT_BUBBLE_SM = ("Microsoft YaHei UI", 10)        # 系统提示/辅助说明
+# Emoji 设备/图标字形(按 delegated 任务要求:设备卡与顶栏用 emoji/Unicode 字形)
+FONT_EMOJI = ("Segoe UI Emoji", 13)
+FONT_APPBAR_ICO = ("Segoe UI", 12)                  # 顶栏 Unicode 图标(⟳ 🌓)
+
+
+class _ChatPane:
+    """AI 对话气泡面板:AI 左灰底、用户右紫底、系统提示居中浅色。
+
+    用 Canvas + 内层 Frame 模拟可滚动消息流(每条消息一个 Label),
+    取代纯文本 Text 追加,呈现对齐设计稿的气泡式对话。
+    """
+
+    def __init__(self, parent: tk.Misc, width: int = 420,
+                 height: int = 260) -> None:
+        # 外层描边框:让对话区在深色底上明确成一个"面板"(对齐设计稿)
+        self.frame = tk.Frame(parent, bg=THEME["border2"], bd=0)
+        # 用 pack 而非 grid_propagate(False):frame 尺寸由 canvas 请求,
+        # 气泡才能随内容增高(曾因 grid_propagate(False) 导致 frame 塌成 1x1)
+        self.canvas = tk.Canvas(self.frame, bg=THEME["surface"], highlightthickness=1,
+                                highlightbackground=THEME["border"],
+                                highlightcolor=THEME["border"],
+                                width=width, height=height, bd=0)
+        self.scroll = ttk.Scrollbar(self.frame, orient="vertical",
+                                    command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scroll.grid(row=0, column=1, sticky="ns")
+        self.inner = tk.Frame(self.canvas, bg=THEME["surface"])
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>",
+                        lambda _e: self.canvas.configure(
+                            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        # 滚轮只在指针进入对话区时全局接管,离开即归还:避免与中栏步骤卡片
+        # 同时滚动(此前用 bind_all 常驻,鼠标在任意位置都会带动对话区)
+        self.canvas.bind("<Enter>",
+                         lambda _e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
+        self.frame.bind("<Leave>",
+                        lambda _e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_canvas_resize(self, event: tk.Event) -> None:
+        """内层 Frame 宽度跟随画布,气泡才能贴边换行。"""
+        self.canvas.itemconfigure(self._win, width=max(1, event.width - 2))
+
+    def _on_wheel(self, event: tk.Event) -> None:
+        if not self._scrollable():
+            return
+        first, last = self.canvas.yview()
+        if event.delta < 0 and first <= 0.001:
+            return
+        if event.delta > 0 and last >= 0.999:
+            return
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def _scrollable(self) -> bool:
+        bb = self.canvas.bbox("all")
+        if not bb:
+            return False
+        return bb[3] > self.canvas.winfo_height()
+
+    def _wrap(self, event: tk.Event) -> int:
+        return max(200, event.width - 24)
+
+    def clear(self) -> None:
+        for child in self.inner.winfo_children():
+            child.destroy()
+
+    def add_ai(self, text: str) -> None:
+        self._bubble(text, bg=THEME["bubble_ai"], fg=THEME["txt"],
+                     anchor="w", wrap_width=360)
+
+    def add_user(self, text: str) -> None:
+        self._bubble(text, bg=THEME["bubble_user"], fg="#ffffff",
+                     anchor="e", wrap_width=320)
+
+    def add_sys(self, text: str) -> None:
+        """系统说明:居中浅色小字,用于欢迎语/操作提示。"""
+        lbl = tk.Label(self.inner, text=text, bg=THEME["surface"], fg=THEME["txt2"],
+                       font=FONT_BUBBLE_SM, justify="center", wraplength=340)
+        lbl.pack(pady=(10, 14), padx=14, anchor="center")
+
+    def _bubble(self, text: str, bg: str, fg: str, anchor: str,
+                wrap_width: int) -> None:
+        # 高 1px 的 relief 描边:让气泡在深色底上有清晰边界(纯色块在截图里会"消失")
+        lbl = tk.Label(self.inner, text=text, bg=bg, fg=fg, font=FONT_BUBBLE,
+                       justify="left", wraplength=wrap_width,
+                       padx=12, pady=8, bd=1, relief="solid",
+                       highlightthickness=0)
+        lbl.configure(highlightbackground=THEME["bubble_border"],
+                      highlightcolor=THEME["bubble_border"])
+        holder = tk.Frame(self.inner, bg=THEME["surface"])
+        lbl.pack(in_=holder, padx=10, pady=(0, 10), anchor=anchor)
+        holder.pack(fill="x", anchor=anchor)
+        self._to_bottom()
+
+    def _to_bottom(self) -> None:
+        self.frame.update_idletasks()
+        if self._scrollable():
+            self.canvas.yview_moveto(1.0)
 
 
 class _UiBridge:
@@ -178,8 +330,12 @@ class DeviceSelectDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("选择设备")
         self.resizable(False, False)
+        self.configure(background=THEME["bg"])
         self.selected: Optional[str] = None
         self._busy = False
+        # v3 卡片列表状态:最近一次枚举结果 + 当前点选的在线序列号
+        self._devices: List[tuple] = []
+        self._sel_serial: Optional[str] = None
         # 后台线程经 bridge 回主线程;对话框销毁时 close,杜绝跨线程 Tk 调用
         self._bridge = _UiBridge(self)
         self._build_ui()
@@ -187,17 +343,28 @@ class DeviceSelectDialog(tk.Toplevel):
         # 状态,Windows 下 transient 子窗口会被连带强制 withdrawn,表现为窗口完全
         # 不显示、进程却在跑。不设 transient 时对话框独立映射,并在任务栏有入口。
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.geometry("560x330")
+        # 尺寸自适应内容:曾硬编码 560x330,暗色主题下 Treeview 行高变大后
+        # 内容超出固定高度,底部「刷新/确定/取消」被挤出可视区(用户实测截图问题)。
+        self.update_idletasks()
+        self.geometry(self._fit_geometry())
         self._center_on_screen()
         self._bring_to_front()
         self.grab_set()
         # 进入即自动检测一次
         self.after(50, self._refresh_devices)
 
-    def _center_on_screen(self) -> None:
-        """把对话框居中到屏幕。"""
+    def _fit_geometry(self, min_h: int = 280, max_h: int = 560) -> str:
+        """按内容实际高度计算窗口尺寸(v3 弹窗宽 480),避免固定几何裁切内容。"""
         self.update_idletasks()
-        w, h = 560, 330
+        w = max(480, self.winfo_reqwidth())
+        h = max(min_h, min(max_h, self.winfo_reqheight()))
+        return f"{w}x{h}"
+
+    def _center_on_screen(self) -> None:
+        """把对话框(当前实际尺寸)居中到屏幕。"""
+        self.update_idletasks()
+        w = max(480, self.winfo_reqwidth())
+        h = max(280, self.winfo_reqheight())
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
@@ -215,38 +382,51 @@ class DeviceSelectDialog(tk.Toplevel):
         self.focus_force()
 
     # ------------------------------------------------------------------
-    # UI
+    # UI(v3 卡片样式,对齐 design_proposal_v3.html .modal/.devcard)
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        frm = ttk.Frame(self, padding=12)
-        frm.grid(sticky="nsew")
+        # 整窗即一张 modal:surface 底 + 较强 1px 描边(圆角/阴影 Tk 无原生支持)
+        modal = tk.Frame(self, bg=THEME["surface"], highlightthickness=1,
+                         highlightbackground=THEME["border2"])
+        modal.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="请选择要连接的 adb 设备(仅\"在线\"设备可进入):").grid(
-            row=0, column=0, columnspan=3, sticky="w")
+        # 头部:标题 + 右侧 ✕(= 取消退出)
+        hd = tk.Frame(modal, bg=THEME["surface"])
+        hd.pack(fill="x", padx=18, pady=(15, 0))
+        tk.Label(hd, text="连接设备", bg=THEME["surface"], fg=THEME["txt"],
+                 font=FONT_UI_BOLD).pack(side="left")
+        x_lbl = tk.Label(hd, text="✕", bg=THEME["surface"], fg=THEME["txt3"],
+                         font=FONT_UI)
+        x_lbl.pack(side="right")
+        x_lbl.bind("<Button-1>", lambda _e: self._cancel())
 
-        self.tree = ttk.Treeview(frm, columns=("serial", "state"),
-                                 show="headings", height=8, selectmode="browse")
-        self.tree.heading("serial", text="设备序列号")
-        self.tree.heading("state", text="状态")
-        self.tree.column("serial", width=300, anchor="w")
-        self.tree.column("state", width=220, anchor="w")
-        self.tree.grid(row=1, column=0, columnspan=3, pady=8, sticky="ew")
-        self.tree.tag_configure("unavailable", foreground="#999")
-        self.tree.bind("<Double-1>", lambda e: self._confirm())
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._sync_ok_state())
+        # 主体:引导语 + 设备卡片容器 + 状态行
+        bd = tk.Frame(modal, bg=THEME["surface"])
+        bd.pack(fill="both", expand=True, padx=18, pady=(14, 0))
+        tk.Label(bd, text="选择一台在线设备以进入控制台",
+                 bg=THEME["surface"], fg=THEME["txt2"], font=FONT_CAPTION,
+                 anchor="w").pack(fill="x")
+        self._dev_list_frame = tk.Frame(bd, bg=THEME["surface"])
+        self._dev_list_frame.pack(fill="both", expand=True, pady=(13, 0))
 
         self.status_var = tk.StringVar(value="正在检测设备…")
-        ttk.Label(frm, textvariable=self.status_var, foreground="#b00",
-                  wraplength=530, justify="left").grid(
-            row=2, column=0, columnspan=3, sticky="w")
+        self.status_label = tk.Label(bd, textvariable=self.status_var,
+                                     bg=THEME["surface"], fg=THEME["txt2"],
+                                     font=FONT_CAPTION, wraplength=440,
+                                     justify="left", anchor="w")
+        self.status_label.pack(fill="x", pady=(12, 16))
 
-        self.refresh_btn = ttk.Button(frm, text="⟳ 刷新", command=self._refresh_devices)
-        self.refresh_btn.grid(row=3, column=0, sticky="w", pady=(10, 0))
-        self.ok_btn = ttk.Button(frm, text="确定", command=self._confirm, state="disabled")
-        self.ok_btn.grid(row=3, column=1, sticky="e", padx=(8, 4), pady=(10, 0))
-        self.cancel_btn = ttk.Button(frm, text="取消", command=self._cancel)
-        self.cancel_btn.grid(row=3, column=2, sticky="e", pady=(10, 0))
-        frm.columnconfigure(0, weight=1)
+        # 底部:顶边分隔 + 「⟳ 刷新」 + 主按钮「进入控制台」
+        ft = tk.Frame(modal, bg=THEME["surface"], highlightthickness=1,
+                      highlightbackground=THEME["border"],
+                      highlightcolor=THEME["border"])
+        ft.pack(fill="x", side="bottom")
+        self.refresh_btn = _RoundedButton(ft, text="↻ 刷新",
+                                          command=self._refresh_devices)
+        self.refresh_btn.pack(side="left", padx=18, pady=12)
+        self.ok_btn = _RoundedButton(ft, text="进入控制台", command=self._confirm,
+                                     style="primary", state="disabled")
+        self.ok_btn.pack(side="right", padx=18, pady=12)
 
     # ------------------------------------------------------------------
     # 设备枚举(后台线程)
@@ -258,8 +438,9 @@ class DeviceSelectDialog(tk.Toplevel):
         self.refresh_btn.configure(state="disabled")
         self.ok_btn.configure(state="disabled")
         self.status_var.set("正在执行 adb devices 检测设备…")
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
+        # 清空旧设备卡片(容器在,子控件销毁)
+        for w in self._dev_list_frame.winfo_children():
+            w.destroy()
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self) -> None:
@@ -281,50 +462,124 @@ class DeviceSelectDialog(tk.Toplevel):
         if error is not None:
             self.status_var.set(
                 f"设备检测失败: {error}\n请确认 adb 已安装并加入 PATH,然后点「⟳ 刷新」重试。")
+            self.status_label.configure(fg=THEME["red"])
+            self.geometry(self._fit_geometry())
             return
 
-        online_serials = []
-        for serial, state in devices:
-            available = state == "device"
-            tags = () if available else ("unavailable",)
-            self.tree.insert(
-                "", "end", iid=serial,
-                values=(serial, self.STATE_LABELS.get(state, state)),
-                tags=tags,
-            )
-            if available:
-                online_serials.append(serial)
+        self._devices = devices
+        online_serials = [serial for serial, state in devices
+                          if state == "device"]
+        # 重建设备卡片(清空旧卡)
+        self._render_dev_cards()
 
         if online_serials:
             self.status_var.set(
                 f"共 {len(devices)} 台设备,其中 {len(online_serials)} 台在线。"
-                "双击设备或选中后点「确定」。")
+                "双击设备或选中后点「进入控制台」。")
             # 只有一台在线设备时自动选中,省一次点击
             if len(online_serials) == 1:
-                self.tree.selection_set(online_serials[0])
-                self.tree.focus(online_serials[0])
+                self._select_card(online_serials[0])
         elif devices:
+            self._sel_serial = None
             self.status_var.set(
                 "检测到设备但均不可用(离线/未授权)。请在手机上允许 USB 调试"
                 "或等待设备上线,然后点「⟳ 刷新」。")
         else:
+            self._sel_serial = None
             self.status_var.set(
                 "未检测到设备。请连接手机(开启 USB 调试)或启动模拟器,"
                 "然后点「⟳ 刷新」。")
+        self.status_label.configure(fg=THEME["txt2"])
+        # 设备数量变化会改变内容高度,重新贴合一次避免裁切
+        self.geometry(self._fit_geometry())
+        self._sync_ok_state()
+
+    # ------------------------------------------------------------------
+    # 设备卡片渲染(v3 .devcard)
+    # ------------------------------------------------------------------
+    # 非在线状态 -> 徽章短文案(STATE_LABELS 的完整文案留给状态行)
+    _BADGE_SHORT = {
+        "offline": "离线",
+        "unauthorized": "未授权",
+        "recovery": "恢复模式",
+    }
+
+    def _render_dev_cards(self) -> None:
+        """按 self._devices 重建全部设备卡片。"""
+        for w in self._dev_list_frame.winfo_children():
+            w.destroy()
+        for serial, state in self._devices:
+            self._make_dev_card(serial, state)
+
+    def _make_dev_card(self, serial: str, state: str) -> None:
+        """构造一台设备的卡片(在线可点选,离线灰显不可选)。"""
+        online = state == "device"
+        selected = self._sel_serial == serial
+        card_bg = THEME["accent_soft"] if selected else THEME["bg2"]
+        card_hl = THEME["accent"] if selected else THEME["border2"]
+        card = tk.Frame(self._dev_list_frame, bg=card_bg,
+                        highlightthickness=1, highlightbackground=card_hl)
+        card.pack(fill="x", pady=(0, 10))
+
+        # 左:设备图标块(网络设备 🖥,其余 📱)
+        icon_txt = "🖥" if ":" in serial else "📱"
+        icon = tk.Label(card, text=icon_txt, bg=THEME["surface2"],
+                        fg=THEME["accent"] if selected else THEME["txt2"],
+                        font=FONT_EMOJI, padx=7, pady=5)
+        icon.pack(side="left", padx=(11, 0), pady=11)
+
+        # 中:mono 序列号 + meta 文案
+        info = tk.Frame(card, bg=card_bg)
+        info.pack(side="left", fill="x", expand=True, padx=13, pady=11)
+        nm = tk.Label(info, text=serial, bg=card_bg, fg=THEME["txt"],
+                      font=FONT_MONO, anchor="w")
+        nm.pack(fill="x")
+        meta_txt = self._device_meta(serial)
+        meta_lbl = tk.Label(info, text=meta_txt, bg=card_bg, fg=THEME["txt3"],
+                            font=FONT_CAPTION, anchor="w")
+        meta_lbl.pack(fill="x", pady=(3, 0))
+
+        # 右:在线绿/离线红中性徽章(不发光)
+        if online:
+            badge_txt, badge_fg = "● 在线", THEME["green"]
+        else:
+            badge_txt = "● " + self._BADGE_SHORT.get(
+                state, self.STATE_LABELS.get(state, state))
+            badge_fg = THEME["red"]
+        badge = tk.Label(card, text=badge_txt, bg=card_bg, fg=badge_fg,
+                         font=FONT_CAPTION)
+        badge.pack(side="right", padx=13)
+
+        # 仅在线卡片可点:单击选中、双击确认(默认参数捕获序列号,避开闭包问题)
+        if online:
+            clickables = (card, icon, info, nm, meta_lbl, badge)
+            for w in clickables:
+                w.bind("<Button-1>",
+                       lambda _e, s=serial: self._select_card(s))
+                w.bind("<Double-Button-1>",
+                       lambda _e, s=serial: self._confirm())
+
+    @staticmethod
+    def _device_meta(serial: str) -> str:
+        """设备卡片 meta 文案:网络/模拟器/USB。"""
+        if ":" in serial:
+            return "Network"
+        if serial.startswith("emulator"):
+            return "Android Emulator"
+        return "USB 设备"
+
+    def _select_card(self, serial: str) -> None:
+        """点选一张在线设备卡:记录、重渲染选中态、同步主按钮。"""
+        self._sel_serial = serial
+        self._render_dev_cards()
         self._sync_ok_state()
 
     # ------------------------------------------------------------------
     # 选择确认
     # ------------------------------------------------------------------
     def _selected_serial(self) -> Optional[str]:
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        iid = sel[0]
-        # 灰显行(离线/未授权)即使被键盘高亮也不允许确认
-        if "unavailable" in self.tree.item(iid, "tags"):
-            return None
-        return iid
+        # 选中态只可能来自在线卡片点击(离线卡片不绑定选择),直接返回即可
+        return self._sel_serial
 
     def _sync_ok_state(self) -> None:
         state = "normal" if self._selected_serial() else "disabled"
@@ -351,13 +606,133 @@ class DeviceSelectDialog(tk.Toplevel):
         self.destroy()
 
 
+class _RoundedBadge(tk.Label):
+    """圆角数字徽章:用 PIL 绘制圆角矩形底图(非交互,纯展示)。"""
+
+    _img_cache: Dict[tuple, ImageTk.PhotoImage] = {}
+
+    @classmethod
+    def _make_bg(cls, w: int, h: int, r: int, fill: str) -> ImageTk.PhotoImage:
+        key = (w, h, r, fill)
+        if key not in cls._img_cache:
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
+            cls._img_cache[key] = ImageTk.PhotoImage(img)
+        return cls._img_cache[key]
+
+    def __init__(self, parent, text: str, size: int = 22, radius: int = 5,
+                 fill: str = THEME["accent"], fg: str = "#fff",
+                 font=FONT_CAPTION, **kwargs):
+        self._img = self._make_bg(size, size, radius, fill)
+        try:
+            _parent_bg = parent.cget("bg") or THEME["bg2"]
+        except tk.TclError:
+            _parent_bg = THEME["bg2"]
+        super().__init__(parent, image=self._img, compound="center",
+                         text=text, fg=fg, font=font, bg=_parent_bg,
+                         bd=0, padx=0, pady=0, **kwargs)
+
+
+class _RoundedButton(tk.Label):
+    """圆角按钮:用 PIL 绘制圆角矩形底图,支持 normal/primary/ghost + hover。
+
+    对齐设计稿 .btn:font 13px、圆角 6px、内边距 7px 14px、1px border2 描边。
+    """
+
+    _img_cache: Dict[tuple, ImageTk.PhotoImage] = {}
+
+    @classmethod
+    def _make_bg(cls, w: int, h: int, r: int, fill: str,
+                 outline: Optional[str] = None) -> ImageTk.PhotoImage:
+        key = (w, h, r, fill, outline)
+        if key not in cls._img_cache:
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            if outline:
+                d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill, outline=outline, width=1)
+            else:
+                d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
+            cls._img_cache[key] = ImageTk.PhotoImage(img)
+        return cls._img_cache[key]
+
+    def __init__(self, parent, text: str = "", command=None, style: str = "normal",
+                 width: Optional[int] = None, height: int = 30,
+                 radius: int = 6, icon: str = "", **kwargs):
+        self.command = command
+        self.style = style
+        self._enabled = True
+        palette = {
+            "normal":  (THEME["surface2"], THEME["border2"], THEME["txt"], THEME["accent_bg"]),
+            "primary": (THEME["accent"],   THEME["accent"],  "#ffffff",     "#8b7ce0"),
+            "ghost":   (THEME["surface"],  THEME["border2"], THEME["txt2"], THEME["surface2"]),
+        }
+        self._fill, self._bd, self._fg, self._fill_hover = palette.get(style, palette["normal"])
+        self._text = (f"{icon}  " if icon else "") + text
+        self._height = height
+        self._radius = radius
+        # 估算文字宽度(等宽不够精确,用 tkFont 实测)
+        from tkinter import font as _tkfont
+        f = _tkfont.Font(family=FONT_BTN[0], size=FONT_BTN[1])
+        text_w = f.measure(self._text)
+        self._width = width or max(56, text_w + 28)  # 左右各 14px 内边距
+        self._build_images()
+        # 取父容器背景色(圆角图的透明角需与父容器同色才无缝)
+        try:
+            _parent_bg = parent.cget("bg") or THEME["surface"]
+        except tk.TclError:
+            _parent_bg = THEME["surface"]
+        super().__init__(parent, image=self._img_normal, compound="center",
+                         text=self._text, fg=self._fg, font=FONT_BTN,
+                         bg=_parent_bg,
+                         bd=0, padx=0, pady=0, cursor="hand2")
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _build_images(self) -> None:
+        self._img_normal = self._make_bg(self._width, self._height, self._radius,
+                                         self._fill, self._bd)
+        self._img_hover = self._make_bg(self._width, self._height, self._radius,
+                                        self._fill_hover, self._bd)
+        self._img_disabled = self._make_bg(self._width, self._height, self._radius,
+                                           THEME["surface2"], THEME["border"])
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            self.configure(image=self._img_hover)
+
+    def _on_leave(self, _e):
+        if self._enabled:
+            self.configure(image=self._img_normal)
+
+    def _on_click(self, _e):
+        if self._enabled and self.command:
+            self.command()
+
+    def configure(self, **kw):
+        if "state" in kw:
+            self._enabled = kw.pop("state") != "disabled"
+            self.configure(image=self._img_disabled if not self._enabled else self._img_normal)
+            self.configure(cursor="" if not self._enabled else "hand2")
+        if kw:
+            super().configure(**kw)
+
+    def config(self, **kw):
+        self.configure(**kw)
+
+
 class StepApp(tk.Tk):
     """步骤编排主窗口:网格图选格 + 步骤列表 + 执行控制。"""
 
     def __init__(self) -> None:
         super().__init__()
         self.title("GrapeMobile 步骤编排器")
-        self.resizable(False, False)
+        # 可缩放:固定尺寸会把右栏 Spinbox/按钮裁掉(实测截图问题)
+        self.resizable(True, True)
+        self.minsize(1200, 720)
+        # 暗色克制主题(单一葡萄紫强调色,无霓虹/渐变);须在任意控件创建前应用
+        self._apply_dark_theme()
         # 主窗口在设备选择/首次截图完成前保持隐藏,避免弹出主窗口后又因失败退出
         self.withdraw()
         self._startup_ok = False
@@ -430,15 +805,15 @@ class StepApp(tk.Tk):
         locate_logger.setLevel(logging.INFO)
         if not any(isinstance(h, _AiLogHandler) for h in locate_logger.handlers):
             locate_logger.addHandler(_AiLogHandler(self))
-        # 默认打开 AI 模式 Tab(用户主要工作区)
-        self.notebook.select(1)
-        # AI 模式欢迎语
-        self._ai_chat_append("AI", "你好!我是 AI 步骤编排助手。\n"
-                            "输入你想做的操作(如:点击kof图标),我定位后\n"
-                            "点「✓ 保存为步骤」即可存入脚本步骤。\n"
-                            "也可以切换到普通模式直接点格子添加步骤。")
+        # 默认打开 AI 模式 Tab(右栏第 0 页;用户主要工作区)
+        self._switch_tab(0)
+        # AI 模式欢迎语(系统提示样式,居中浅色)
+        self._ai_chat_append("系统", "输入想做的操作(如「点击 kof 图标」),\n"
+                                     "定位后确认即可存入脚本步骤。\n"
+                                     "也可以切到普通模式直接点格子添加步骤。")
 
         # ---- 伪实时:每秒自动重截(后台线程生产,主线程应用) ----
+        self._auto_var = tk.BooleanVar(value=False)  # 自动刷新开关
         self._auto_busy = False        # 是否有截图线程在跑(防止重叠)
         self._auto_fail_logged = False # 连续失败只记一次日志,避免刷屏
         self.after(1000, self._auto_tick)
@@ -575,7 +950,10 @@ class StepApp(tk.Tk):
         disp = cv2.resize(grid_bgr, (self.disp_w, self.disp_h), interpolation=cv2.INTER_AREA)
         self._tmp = os.path.join(tempfile.gettempdir(), "grapemobile_grid_display.png")
         cv2.imwrite(self._tmp, disp)
-        self.photo = tk.PhotoImage(file=self._tmp)
+        new_photo = tk.PhotoImage(file=self._tmp)
+        old_photo = getattr(self, "photo", None)
+        self.photo = new_photo
+        self._photo_ref = old_photo  # 保持引用,避免旧图被 GC 导致画布闪黑
         if hasattr(self, "canvas"):
             self.canvas.configure(width=self.disp_w, height=self.disp_h)
             self.canvas.delete("all")
@@ -589,214 +967,585 @@ class StepApp(tk.Tk):
             self._ai_adjusted = False
             self._ai_drag_last = None
             if hasattr(self, "_ai_confirm_btn"):
-                self._ai_confirm_btn.grid_remove()
-                self._ai_deny_btn.grid_remove()
-                self._ai_next_btn.grid_remove()
+                self._show_cand_card(False)
                 self._ai_cand_info_var.set("")
+
+    # ------------------------------------------------------------------
+    # 暗色主题
+    # ------------------------------------------------------------------
+    def _apply_dark_theme(self) -> None:
+        """应用暗色克制主题:全局 option_add(tk 原生控件)+ ttk.Style(ttk 控件)。
+
+        仅在 __init__ 早期、任意控件创建前调用一次;不改动任何业务/布局逻辑。
+        视觉定调:单一葡萄紫强调色、无霓虹渐变、中性工程状态色。
+        """
+        T = THEME
+        # ---- tk 原生控件:Text / Listbox / Canvas / Toplevel 等 ----
+        # 兜底:*background / *foreground 覆盖未显式指定底色的 tk 控件(含窗口本身)
+        self.option_add("*background", T["bg"])
+        self.option_add("*foreground", T["txt"])
+        self.option_add("*Toplevel.background", T["bg"])
+        self.option_add("*highlightBackground", T["border2"])
+        self.option_add("*highlightColor", T["accent"])
+        self.option_add("*Text.background", T["term_bg"])
+        self.option_add("*Text.foreground", T["term_fg"])
+        self.option_add("*Text.selectBackground", T["accent"])
+        self.option_add("*Text.selectForeground", "#ffffff")
+        self.option_add("*Listbox.background", T["surface2"])
+        self.option_add("*Listbox.foreground", T["txt"])
+        self.option_add("*Listbox.selectBackground", T["accent"])
+        self.option_add("*Listbox.selectForeground", "#ffffff")
+        self.option_add("*Canvas.background", T["bg"])
+        self.option_add("*Entry.background", T["surface2"])
+        self.option_add("*Entry.foreground", T["txt"])
+
+        # ---- ttk 控件:基于 clam 主题重配暗色(原生 Windows 主题无法整体压暗) ----
+        try:
+            style = ttk.Style(self)
+            style.theme_use("clam")
+        except Exception:
+            style = ttk.Style(self)
+        style.configure(".", background=T["bg"], foreground=T["txt"],
+                        bordercolor=T["border"], darkcolor=T["surface2"],
+                        lightcolor=T["surface"], troughcolor=T["surface2"],
+                        font=FONT_UI)
+        style.configure("TFrame", background=T["bg"])
+        style.configure("TLabel", background=T["bg"], foreground=T["txt"],
+                        font=FONT_UI)
+        # 区块小标题:小一号、次要色(对齐设计稿的 section caption 层级)
+        style.configure("Caption.TLabel", background=T["bg"], foreground=T["txt2"],
+                        font=FONT_CAPTION)
+        # 顶栏:品牌名(粗体)与设备状态
+        style.configure("Brand.TLabel", background=T["bg"], foreground=T["txt"],
+                        font=FONT_UI_BOLD)
+        style.configure("TButton", background=T["surface2"], foreground=T["txt"],
+                        bordercolor=T["border2"], relief="flat", padding=(12, 6),
+                        font=FONT_BTN)
+        style.map("TButton",
+                  background=[("active", T["accent_bg"]), ("pressed", T["accent_bg"])],
+                  foreground=[("active", T["txt"])])
+        style.configure("Accent.TButton", background=T["accent"], foreground="#ffffff",
+                        bordercolor=T["accent"], relief="flat", padding=(12, 6),
+                        font=FONT_BTN_BOLD)
+        style.map("Accent.TButton",
+                  background=[("active", "#8b7ce0"), ("pressed", "#8b7ce0")],
+                  foreground=[("active", "#ffffff"), ("disabled", "#ffffff")])
+        style.configure("TEntry", fieldbackground=T["surface2"], foreground=T["txt"],
+                        bordercolor=T["border2"], insertcolor=T["txt"],
+                        padding=(11, 10), font=FONT_BTN)
+        style.configure("TCombobox", fieldbackground=T["surface2"], foreground=T["txt"],
+                        bordercolor=T["border2"], arrowcolor=T["txt2"], font=FONT_BTN)
+        style.map("TCombobox", fieldbackground=[("readonly", T["surface2"])])
+        style.configure("TSpinbox", fieldbackground=T["surface2"], foreground=T["txt"],
+                        bordercolor=T["border2"], arrowcolor=T["txt2"], font=FONT_BTN,
+                        padding=(8, 6))
+        style.configure("TCheckbutton", background=T["bg"], foreground=T["txt"])
+        style.configure("TNotebook", background=T["bg"], bordercolor=T["border"])
+        style.configure("TNotebook.Tab", background=T["surface"], foreground=T["txt2"],
+                        padding=(16, 7), font=FONT_UI)
+        style.map("TNotebook.Tab", background=[("selected", T["bg"])],
+                  foreground=[("selected", T["accent"])])
+        style.configure("TScrollbar", background=T["surface2"], troughcolor=T["bg"],
+                        bordercolor=T["border"], arrowcolor=T["txt2"])
+        style.configure("Treeview", background=T["surface"], foreground=T["txt"],
+                        fieldbackground=T["surface"], bordercolor=T["border"],
+                        rowheight=30, font=FONT_LIST)
+        style.configure("Treeview.Heading", background=T["surface2"], foreground=T["txt2"],
+                        bordercolor=T["border"], relief="flat", font=FONT_CAPTION)
+        style.map("Treeview", background=[("selected", T["accent_bg"])],
+                  foreground=[("selected", T["txt"])])
+        style.configure("Separator", background=T["border"])
 
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=8)
-        root.grid(row=0, column=0)
+        root = ttk.Frame(self, padding=0)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=0)   # 左栏:设备画面(固定宽)
+        root.columnconfigure(1, weight=1)   # 中栏:步骤实时预览(弹性)
+        root.columnconfigure(2, weight=1)   # 右栏:三 Tab(弹性)
+        root.rowconfigure(1, weight=1)      # 主体行
+        root.rowconfigure(2, weight=0)      # 底部 Console(固定高)
 
-        # 左:网格图画布(两种模式共享)
-        self.canvas = tk.Canvas(root, width=self.disp_w, height=self.disp_h,
-                                highlightthickness=1, highlightbackground="#555")
-        self.canvas.grid(row=0, column=0, rowspan=2)
+        # ==================================================================
+        # 顶栏 appbar:品牌 + 设备状态 pill + 右侧图标按钮(对齐设计稿)
+        # ==================================================================
+        appbar = tk.Frame(root, bg=THEME["bg2"], height=44)
+        appbar.grid(row=0, column=0, columnspan=3, sticky="ew")
+        appbar.grid_propagate(False)
+        # 品牌
+        tk.Label(appbar, text="▣", fg=THEME["accent"], bg=THEME["bg2"],
+                 font=("Segoe UI", 13)).pack(side="left", padx=(14, 4), pady=8)
+        tk.Label(appbar, text="GrapeMobile", fg=THEME["txt"], bg=THEME["bg2"],
+                 font=FONT_UI_BOLD).pack(side="left", pady=8)
+        # 设备状态 pill
+        pill = tk.Frame(appbar, bg=THEME["surface2"], highlightthickness=1,
+                        highlightbackground=THEME["border2"])
+        tk.Label(pill, text="●", fg=THEME["green"], bg=THEME["surface2"],
+                 font=("Segoe UI", 8)).pack(side="left", padx=(8, 4), pady=4)
+        tk.Label(pill, text=f"{self.device_id} · 在线", fg=THEME["txt2"],
+                 bg=THEME["surface2"], font=FONT_CAPTION).pack(side="left",
+                                                                padx=(0, 10), pady=4)
+        pill.pack(side="left", padx=(16, 0), pady=8)
+        # 右侧图标按钮(圆角小方块)
+        for tip, glyph, cmd in (
+            ("刷新截图", "↻", self._refresh),
+            ("截取锚点", "📷", lambda: self._recapture_anchor("before_image")),
+            ("网格", "⊞", self._toggle_grid),
+        ):
+            ib = _RoundedButton(appbar, text=glyph, command=cmd, style="ghost",
+                                width=30)
+            ib.pack(side="right", padx=2, pady=7)
+
+        ttk.Separator(root, orient="horizontal").grid(
+            row=0, column=0, columnspan=3, sticky="sew", pady=(43, 0))
+        # 三栏列权重:左固定300,中/右平分剩余
+        root.grid_columnconfigure(0, weight=0)
+        root.grid_columnconfigure(1, weight=1)
+        root.grid_columnconfigure(2, weight=1)
+        root.grid_rowconfigure(1, weight=1)
+
+        # ==================================================================
+        # 左栏:设备画面(画布 + 工具条 + 提示)
+        # ==================================================================
+        left = tk.Frame(root, bg=THEME["bg"], width=280)
+        left.grid(row=1, column=0, sticky="ns", padx=(10, 0), pady=8)
+        left.grid_propagate(False)
+        tk.Label(left, text="设备画面", fg=THEME["txt3"], bg=THEME["bg"],
+                 font=FONT_CAPTION).pack(anchor="w", pady=(0, 6))
+        self.canvas = tk.Canvas(left, width=self.disp_w, height=self.disp_h,
+                                highlightthickness=1,
+                                highlightbackground=THEME["border2"], bg=THEME["bg2"])
+        self.canvas.pack()
         self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
-        # AI 候选预览时:拖动微调候选点
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        hint = ttk.Label(root, text="普通模式:点击图片添加步骤    |    AI 模式候选出现后:点击/拖动可微调十字位置",
-                         foreground="#666")
-        hint.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        # 工具条
+        tools = tk.Frame(left, bg=THEME["bg"])
+        tools.pack(fill="x", pady=(8, 0))
+        self._grid_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tools, text="网格", variable=self._grid_on,
+                        command=self._toggle_grid).pack(side="left", padx=(0, 6))
+        _RoundedButton(tools, text="－", width=28,
+                       command=lambda: self._zoom(1 / 1.25)).pack(side="left", padx=1)
+        self._zoom_label = tk.Label(tools, text="100%", width=5, anchor="center",
+                                    bg=THEME["bg"], fg=THEME["txt2"], font=FONT_CAPTION)
+        self._zoom_label.pack(side="left", padx=1)
+        _RoundedButton(tools, text="＋", width=28,
+                       command=lambda: self._zoom(1.25)).pack(side="left", padx=1)
+        _RoundedButton(tools, text="1:1", width=36,
+                       command=self._zoom_reset).pack(side="left", padx=(6, 1))
+        tk.Label(left, text="点画面任意处 = 追加一步点击(自动定位格子)",
+                 fg=THEME["txt3"], bg=THEME["bg"], font=FONT_CAPTION,
+                 wraplength=280, justify="left").pack(anchor="w", pady=(8, 0))
 
-        # 右:Tab 切换(普通模式 / AI 模式)
-        self.notebook = ttk.Notebook(root)
-        self.notebook.grid(row=0, column=1, sticky="n", padx=(10, 0))
-
-        # ---- Tab 1: 普通模式(原有步骤列表 + 操作按钮 + 执行日志) ----
-        right = ttk.Frame(self.notebook, padding=(10, 0, 0, 0))
-        self.notebook.add(right, text="普通模式")
-
-        # 脚本名称:保存前必填;保存成功后清空,回到"新建脚本"状态
-        ttk.Label(right, text="脚本名称:").grid(row=0, column=0, sticky="e")
+        # ==================================================================
+        # 中栏:步骤 · 实时预览(脚本名 + 步骤卡片列表 + 运行条 + 步骤详情/锚点)
+        # ==================================================================
+        center = tk.Frame(root, bg=THEME["surface"])
+        center.grid(row=1, column=1, sticky="nsew", padx=10, pady=8)
+        center.grid_columnconfigure(0, weight=1)
+        center.grid_rowconfigure(2, weight=1)
+        tk.Label(center, text="步骤 · 实时预览", fg=THEME["txt3"],
+                 bg=THEME["surface"], font=FONT_CAPTION).grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        # 脚本名行
+        sname = tk.Frame(center, bg=THEME["surface"])
+        sname.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        sname.columnconfigure(0, weight=1)
         self.script_name_var = tk.StringVar(value="")
-        ttk.Entry(right, textvariable=self.script_name_var).grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+        tk.Entry(sname, textvariable=self.script_name_var,
+                 bg=THEME["surface2"], fg=THEME["txt"], font=FONT_BTN,
+                 bd=0, relief="flat", insertbackground=THEME["txt"],
+                 highlightthickness=1,
+                 highlightbackground=THEME["border2"],
+                 highlightcolor=THEME["border2"]).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6), ipady=8)
+        _RoundedButton(sname, text="保存", command=self._save).grid(row=0, column=1, padx=2)
+        _RoundedButton(sname, text="加载", command=self._load).grid(row=0, column=2, padx=2)
+        # 步骤卡片滚动区
+        self._step_cards_wrap = tk.Frame(center, bg=THEME["surface"])
+        self._step_cards_wrap.grid(row=2, column=0, sticky="nsew")
+        self._step_cards_wrap.grid_columnconfigure(0, weight=1)
+        self._step_cards_wrap.grid_rowconfigure(0, weight=1)
+        self._cards_canvas = tk.Canvas(self._step_cards_wrap, bg=THEME["surface"],
+                                       highlightthickness=0)
+        cards_scroll = ttk.Scrollbar(self._step_cards_wrap, orient="vertical",
+                                     command=self._cards_canvas.yview)
+        self._cards_canvas.configure(yscrollcommand=cards_scroll.set)
+        self._cards_canvas.grid(row=0, column=0, sticky="nsew")
+        cards_scroll.grid(row=0, column=1, sticky="ns")
+        self._step_cards_inner = tk.Frame(self._cards_canvas, bg=THEME["surface"])
+        self._cards_win = self._cards_canvas.create_window(
+            (0, 0), window=self._step_cards_inner, anchor="nw")
+        self._step_cards_inner.bind("<Configure>",
+            lambda _e: self._cards_canvas.configure(
+                scrollregion=self._cards_canvas.bbox("all")))
+        self._cards_canvas.bind("<Configure>",
+            lambda e: self._cards_canvas.itemconfigure(self._cards_win, width=e.width))
+        # 运行条(居中紧凑排列)
+        runbar = tk.Frame(center, bg=THEME["surface"])
+        runbar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        runbar_btns = tk.Frame(runbar, bg=THEME["surface"])
+        runbar_btns.pack()
+        self.run_btn = _RoundedButton(runbar_btns, text="▶ 运行", command=self._run,
+                                      style="primary", width=96)
+        self.run_btn.pack(side="left", padx=3)
+        self.full_run_btn = _RoundedButton(runbar_btns, text="完整运行", command=self._full_run,
+                                           width=96)
+        self.full_run_btn.pack(side="left", padx=3)
+        _RoundedButton(runbar_btns, text="清空", command=self._clear, style="ghost",
+                       width=96).pack(side="left", padx=3)
+        # 步骤详情 + 锚点(复用原 preview 控件,置于中栏卡片下方)
+        self.preview_frame = tk.Frame(center, bg=THEME["bg2"],
+                                      highlightthickness=1,
+                                      highlightbackground=THEME["border"])
+        self.preview_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.preview_frame.grid_columnconfigure(0, weight=1)
+        self.preview_frame.grid_columnconfigure(1, weight=1)
+        self._preview_index: Optional[int] = None
+        ttk.Label(self.preview_frame, text="步骤详情 / 锚点", style="Caption.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+        self._detail_info_var = tk.StringVar(value="未选中步骤")
+        ttk.Label(self.preview_frame, textvariable=self._detail_info_var,
+                  foreground=THEME["txt2"], wraplength=340, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
+        waits = ttk.Frame(self.preview_frame)
+        waits.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 0))
+        self._detail_before_var = tk.StringVar(value="0")
+        self._detail_after_var = tk.StringVar(value="0")
+        ttk.Label(waits, text="前等待(s)", style="Caption.TLabel").grid(row=0, column=0)
+        ttk.Spinbox(waits, from_=0, to=600, width=6,
+                    textvariable=self._detail_before_var).grid(row=0, column=1, padx=(2, 10))
+        ttk.Label(waits, text="后等待(s)", style="Caption.TLabel").grid(row=0, column=2)
+        ttk.Spinbox(waits, from_=0, to=600, width=6,
+                    textvariable=self._detail_after_var).grid(row=0, column=3, padx=(2, 10))
+        _RoundedButton(waits, text="保存等待",
+                       command=self._apply_step_detail).grid(row=0, column=4, padx=(8, 0))
+        # 锚点图横向排列
+        anchors = ttk.Frame(self.preview_frame)
+        anchors.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 6))
+        anchors.columnconfigure(0, weight=1)
+        anchors.columnconfigure(1, weight=1)
+        ttk.Label(anchors, text="执行前(开始条件)", style="Caption.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(anchors, text="执行后(完成条件)", style="Caption.TLabel").grid(
+            row=0, column=1, sticky="w")
+        self._before_photo = self._make_placeholder_image()
+        self.before_img_label = tk.Label(
+            anchors, image=self._before_photo, width=EXPECT_IMG_W, height=EXPECT_IMG_H,
+            highlightthickness=1, highlightbackground=THEME["border2"],
+            bg=THEME["surface2"])
+        self.before_img_label.grid(row=1, column=0, sticky="w", pady=2)
+        self._after_photo = self._make_placeholder_image()
+        self.after_img_label = tk.Label(
+            anchors, image=self._after_photo, width=EXPECT_IMG_W, height=EXPECT_IMG_H,
+            highlightthickness=1, highlightbackground=THEME["border2"],
+            bg=THEME["surface2"])
+        self.after_img_label.grid(row=1, column=1, sticky="w", pady=2)
+        self.before_status_var = tk.StringVar(value="未选中步骤")
+        self.after_status_var = tk.StringVar(value="未选中步骤")
+        ttk.Label(anchors, textvariable=self.before_status_var, style="Caption.TLabel",
+                  wraplength=EXPECT_IMG_W, justify="left").grid(row=2, column=0, sticky="w")
+        ttk.Label(anchors, textvariable=self.after_status_var, style="Caption.TLabel",
+                  wraplength=EXPECT_IMG_W, justify="left").grid(row=2, column=1, sticky="w")
+        anchor_btns = tk.Frame(self.preview_frame, bg=THEME["bg2"])
+        anchor_btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        _RoundedButton(anchor_btns, text="重拍执行前图",
+                       command=lambda: self._recapture_anchor("before_image")).pack(
+            side="left", padx=(0, 6))
+        _RoundedButton(anchor_btns, text="截执行后图",
+                   command=lambda: self._recapture_anchor("after_image")).pack(side="left")
 
-        ttk.Label(right, text="步骤列表(双击行修改等待时间)").grid(
-            row=1, column=0, columnspan=3, sticky="w")
+        # ==================================================================
+        # 右栏:三 Tab 笔记本(AI / 普通 / 执行)
+        # ==================================================================
+        right = tk.Frame(root, bg=THEME["bg2"])
+        right.grid(row=1, column=2, sticky="nsew", padx=(10, 10), pady=8)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        # ---- 自定义 Tab 条(高亮药丸式,带图标;active=surface底+accent下划线) ----
+        self._tab_idx = 0
+        self._tab_panels: List[tk.Frame] = []
+        self._tab_buttons: List[tuple] = []
+        tab_bar = tk.Frame(right, bg=THEME["bg2"], height=38)
+        tab_bar.grid(row=0, column=0, sticky="ew")
+        tab_bar.grid_propagate(False)
+        # 顺序与设计一致:AI / 普通 / 执行
+        tab_defs = [("✦", "AI 模式"), ("≡", "普通模式"), ("▶", "执行模式")]
+        for i, (icon, label) in enumerate(tab_defs):
+            tf = tk.Frame(tab_bar, bg=THEME["bg2"])
+            tf.pack(side="left", fill="both", expand=True)
+            lbl = tk.Label(tf, text=f"{icon} {label}", bg=THEME["bg2"],
+                           fg=THEME["txt2"], font=FONT_UI, pady=10)
+            lbl.pack(fill="both", expand=True)
+            uline = tk.Frame(tf, bg=THEME["bg2"], height=2)
+            uline.pack(fill="x", side="bottom")
+            for w in (tf, lbl, uline):
+                w.bind("<Button-1>", lambda _e, idx=i: self._switch_tab(idx))
+            self._tab_buttons.append((tf, lbl, uline))
+        # 三个面板(同格叠放,grid/grid_remove 切换)
+        for i in range(3):
+            p = tk.Frame(right, bg=THEME["surface"])
+            p.grid(row=1, column=0, sticky="nsew")
+            self._tab_panels.append(p)
+        ai_tab = self._tab_panels[0]
+        normal = self._tab_panels[1]
+        exec_tab = self._tab_panels[2]
 
-        # 新增步骤的默认等待时间(不可见,双击行内可改)
+        # ---- 普通模式:脚本名 + 紧凑步骤卡片(nstep) + 底部操作 + 日志 ----
+        normal.columnconfigure(0, weight=1)
+        normal.rowconfigure(1, weight=1)
+        ns = tk.Frame(normal, bg=THEME["surface"])
+        ns.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        ns.columnconfigure(0, weight=1)
+        tk.Entry(ns, textvariable=self.script_name_var,
+                 bg=THEME["surface2"], fg=THEME["txt"], font=FONT_BTN,
+                 bd=0, relief="flat", insertbackground=THEME["txt"],
+                 highlightthickness=1,
+                 highlightbackground=THEME["border2"],
+                 highlightcolor=THEME["border2"]).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6), ipady=8)
+        _RoundedButton(ns, text="保存脚本", command=self._save).grid(row=0, column=1, padx=2)
+        _RoundedButton(ns, text="加载脚本", command=self._load).grid(row=0, column=2, padx=2)
+        # 紧凑卡片容器(Canvas 滚动)
+        nc_wrap = tk.Frame(normal, bg=THEME["surface"])
+        nc_wrap.grid(row=1, column=0, sticky="nsew", padx=10)
+        nc_wrap.columnconfigure(0, weight=1)
+        nc_wrap.rowconfigure(0, weight=1)
+        self._normal_canvas = tk.Canvas(nc_wrap, bg=THEME["surface"],
+                                        highlightthickness=0)
+        self._normal_canvas.grid(row=0, column=0, sticky="nsew")
+        nc_sb = ttk.Scrollbar(nc_wrap, orient="vertical",
+                              command=self._normal_canvas.yview)
+        nc_sb.grid(row=0, column=1, sticky="ns")
+        self._normal_canvas.configure(yscrollcommand=nc_sb.set)
+        self._normal_inner = tk.Frame(self._normal_canvas, bg=THEME["surface"])
+        self._normal_win = self._normal_canvas.create_window(
+            (0, 0), window=self._normal_inner, anchor="nw")
+        self._normal_inner.bind("<Configure>", lambda _e: self._normal_canvas.configure(
+            scrollregion=self._normal_canvas.bbox("all")))
+        self._normal_canvas.bind("<Configure>", lambda e: self._normal_canvas.itemconfigure(
+            self._normal_win, width=e.width))
+        # 隐藏的 Treeview 作为选中状态模型(不显示)
+        self.listbox = ttk.Treeview(
+            normal, columns=("no", "title", "meta", "waits"), show="headings",
+            selectmode="browse", height=0)
+        self.listbox.bind("<<TreeviewSelect>>", self._on_select)
+        self.listbox.bind("<Double-Button-1>", self._on_step_double_click)
+        # 底部按钮:清空 / 运行(主) / 完整运行(居中紧凑排列,不拉满全宽)
+        nfoot = tk.Frame(normal, bg=THEME["surface"])
+        nfoot.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 6))
+        btns = tk.Frame(nfoot, bg=THEME["surface"])
+        btns.pack()
+        _RoundedButton(btns, text="✕ 清空", command=self._clear, style="ghost",
+                       width=88).pack(side="left", padx=3)
+        _RoundedButton(btns, text="▶ 运行", command=self._run, style="primary",
+                       width=88).pack(side="left", padx=3)
+        _RoundedButton(btns, text="完整运行", command=self._full_run,
+                       width=88).pack(side="left", padx=3)
+        _RoundedButton(nfoot, text="＋ 系统操作", command=self._add_system_step,
+                       width=200).pack(pady=(8, 0))
+        # 普通模式日志区(adb 操作等)
+        log_wrap = tk.Frame(normal, bg=THEME["surface"])
+        log_wrap.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+        tk.Label(log_wrap, text="操作日志", bg=THEME["surface"], fg=THEME["txt2"],
+                 font=FONT_CAPTION).pack(anchor="w", pady=(0, 2))
+        self._normal_log_text = tk.Text(log_wrap, height=5, font=FONT_MONO, state="disabled",
+                                        bg=THEME["term_bg"], fg=THEME["term_fg"],
+                                        wrap="word", relief="flat", bd=0,
+                                        highlightthickness=1,
+                                        highlightbackground=THEME["border2"])
+        self._normal_log_text.pack(fill="x")
+
+        # ---- AI 模式 Tab ----
+        ai_tab.rowconfigure(1, weight=1)
+        ai_tab.columnconfigure(0, weight=1)
+        ttk.Label(ai_tab, text="智能定位", style="Caption.TLabel").grid(row=0, column=0, sticky="w")
+        self._ai_chat = _ChatPane(ai_tab, width=360, height=180)
+        self._ai_chat.frame.grid(row=1, column=0, sticky="nsew", pady=(2, 4))
+        # 候选卡片
+        self._ai_cand_frame = tk.Frame(ai_tab, bg=THEME["surface"])
+        self._ai_cand_info_var = tk.StringVar(value="")
+        tk.Label(self._ai_cand_frame, textvariable=self._ai_cand_info_var,
+                 bg=THEME["surface"], fg=THEME["txt"], font=FONT_MONO,
+                 justify="left", anchor="w").pack(fill="x", padx=8, pady=(6, 2))
+        cand_btns = tk.Frame(self._ai_cand_frame, bg=THEME["surface"])
+        cand_btns.pack(fill="x", padx=6, pady=(0, 4))
+        self._ai_confirm_btn = _RoundedButton(cand_btns, text="保存为步骤",
+                                              command=self._ai_confirm, style="primary")
+        self._ai_confirm_btn.pack(side="left", padx=2)
+        self._ai_deny_btn = _RoundedButton(cand_btns, text="不是",
+                                           command=lambda: self._ai_cycle_candidate(1))
+        self._ai_deny_btn.pack(side="left", padx=2)
+        self._ai_next_btn = _RoundedButton(cand_btns, text="换候选",
+                                           command=lambda: self._ai_cycle_candidate(1))
+        self._ai_next_btn.pack(side="left", padx=2)
+        # 输入行
+        self._ai_input_row = tk.Frame(ai_tab, bg=THEME["surface"])
+        self._ai_input_row.grid(row=2, column=0, sticky="ew", pady=(2, 2))
+        self._ai_input_row.columnconfigure(0, weight=1)
+        self._ai_input_var = tk.StringVar()
+        self._ai_entry = tk.Entry(self._ai_input_row, textvariable=self._ai_input_var,
+                                  bg=THEME["surface2"], fg=THEME["txt"], font=FONT_BTN,
+                                  bd=0, relief="flat", insertbackground=THEME["txt"],
+                                  highlightthickness=1,
+                                  highlightbackground=THEME["border2"],
+                                  highlightcolor=THEME["border2"])
+        self._ai_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4), ipady=8)
+        self._ai_entry.bind("<Return>", lambda e: self._ai_send())
+        self._ai_mode_var = tk.StringVar(value="全流程")
+        ttk.Combobox(self._ai_input_row, textvariable=self._ai_mode_var,
+                     values=["全流程", "仅OCR", "仅VLM"], width=8,
+                     state="readonly").grid(row=0, column=1, padx=(0, 4))
+        _RoundedButton(self._ai_input_row, text="发送", command=self._ai_send,
+                       style="primary").grid(row=0, column=2)
+        # AI 日志
+        ttk.Label(ai_tab, text="AI 日志 · 思考过程", style="Caption.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(6, 2))
+        aibox = ttk.Frame(ai_tab)
+        aibox.grid(row=4, column=0, sticky="ew")
+        aibox.columnconfigure(0, weight=1)
+        self._ai_log_text = tk.Text(aibox, height=6, font=FONT_MONO, state="disabled",
+                                    bg=THEME["term_bg"], fg=THEME["term_fg"],
+                                    wrap="word", relief="flat", bd=0)
+        self._ai_log_text.grid(row=0, column=0, sticky="ew")
+        ai_ls = ttk.Scrollbar(aibox, orient="vertical", command=self._ai_log_text.yview)
+        ai_ls.grid(row=0, column=1, sticky="ns")
+        self._ai_log_text.configure(yscrollcommand=ai_ls.set)
+
+        # ---- 执行模式 Tab ----
+        exec_tab.columnconfigure(0, weight=1)
+        exec_tab.rowconfigure(2, weight=1)
+        ttk.Label(exec_tab, text="勾选测试用例执行(每个对应一个录制脚本)",
+                  style="Caption.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        eh = tk.Frame(exec_tab, bg=THEME["surface"])
+        eh.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        eh.columnconfigure(0, weight=1)
+        _RoundedButton(eh, text="↻ 刷新", command=self._exec_refresh).pack(side="left")
+        _RoundedButton(eh, text="全选", command=lambda: self._exec_set_all(True)).pack(side="left", padx=4)
+        _RoundedButton(eh, text="全不选", command=lambda: self._exec_set_all(False)).pack(side="left")
+        self._exec_tree = ttk.Treeview(
+            exec_tab, columns=("sel", "name", "status"),
+            show="headings", height=10, selectmode="none")
+        self._exec_tree.heading("sel", text="选")
+        self._exec_tree.heading("name", text="用例")
+        self._exec_tree.heading("status", text="状态")
+        self._exec_tree.column("sel", width=36, anchor="center", stretch=False)
+        self._exec_tree.column("name", width=180, anchor="w")
+        self._exec_tree.column("status", width=70, anchor="center", stretch=False)
+        self._exec_tree.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
+        es = ttk.Scrollbar(exec_tab, orient="vertical", command=self._exec_tree.yview)
+        es.grid(row=2, column=1, sticky="ns")
+        self._exec_tree.configure(yscrollcommand=es.set)
+        self._exec_tree.bind("<Button-1>", self._on_exec_tree_click)
+        self._exec_cases: Dict[str, Dict[str, Any]] = {}
+        # 用例详情(点击用例时填充)
+        self._exec_detail_frame = ttk.Frame(exec_tab)
+        self._exec_detail_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self._exec_detail_frame.grid_remove()
+        self._exec_detail_iid: Optional[str] = None
+        self._exec_detail_info = tk.StringVar(value="")
+        ttk.Label(self._exec_detail_frame, textvariable=self._exec_detail_info,
+                  style="Caption.TLabel", wraplength=300, justify="left").pack(anchor="w")
+        self._exec_detail_steps = tk.Text(self._exec_detail_frame, height=4, font=FONT_MONO,
+                                          state="disabled", wrap="none", relief="flat", bd=0)
+        self._exec_detail_steps.pack(fill="x", pady=(2, 2))
+        _RoundedButton(self._exec_detail_frame, text="← 加载到普通模式",
+                       command=self._exec_load_to_normal).pack(anchor="w")
+        # 执行按钮行
+        efoot = tk.Frame(exec_tab, bg=THEME["surface"])
+        efoot.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        efoot.columnconfigure(0, weight=1)
+        efoot.columnconfigure(1, weight=1)
+        self._exec_btn = _RoundedButton(efoot, text="▶ 执行选中用例",
+                                        command=self._exec_checked, style="primary", width=130)
+        self._exec_btn.grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self._exec_open_btn = _RoundedButton(efoot, text="打开报告目录",
+                                             command=self._exec_open_report, width=120)
+        self._exec_open_btn.grid(row=0, column=1, sticky="e", padx=(4, 0))
+        # 执行模式日志
+        self._exec_log_text = tk.Text(exec_tab, height=5, font=FONT_MONO, state="disabled",
+                                      bg=THEME["term_bg"], fg=THEME["term_fg"], wrap="word",
+                                      relief="flat", bd=0)
+        self._exec_log_text.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+        self._exec_busy = False
+        self._last_plan_dir: Optional[str] = None
+        self._exec_refresh()
+
+        # ==================================================================
+        # 底部 Console:常驻执行日志(全宽)
+        # ==================================================================
+        console = tk.Frame(root, bg=THEME["term_bg"], height=130,
+                           highlightthickness=1, highlightbackground=THEME["border"])
+        console.grid(row=2, column=0, columnspan=3, sticky="ew")
+        console.grid_propagate(False)
+        ch = tk.Frame(console, bg=THEME["term_bg"])
+        ch.pack(fill="x", padx=12, pady=(4, 2))
+        tk.Label(ch, text="●", fg=THEME["green"], bg=THEME["term_bg"],
+                 font=("Segoe UI", 8)).pack(side="left")
+        tk.Label(ch, text=" 执行日志 · Console", fg=THEME["txt2"],
+                 bg=THEME["term_bg"], font=FONT_CAPTION).pack(side="left")
+        self.log_text = tk.Text(console, height=6, font=FONT_MONO, state="disabled",
+                                bg=THEME["term_bg"], fg=THEME["term_fg"], wrap="word",
+                                relief="flat", bd=0)
+        self.log_text.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+        # 默认步骤等待时间(画布点击追加步骤时使用)
         self.before_var = tk.StringVar(value="0")
         self.after_var = tk.StringVar(value="10")
 
-        self.listbox = tk.Listbox(right, width=38, height=18, font=("Consolas", 10),
-                                  activestyle="dotbox")
-        self.listbox.grid(row=2, column=0, columnspan=3, pady=4)
-        scroll = ttk.Scrollbar(right, orient="vertical", command=self.listbox.yview)
-        scroll.grid(row=2, column=3, sticky="ns")
-        self.listbox.configure(yscrollcommand=scroll.set)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-        self.listbox.bind("<Double-Button-1>", self._on_step_double_click)
+    # ------------------------------------------------------------------
+    # 画布显示:网格显隐 / 缩放
+    # ------------------------------------------------------------------
+    def _toggle_grid(self) -> None:
+        """网格显隐:关掉时显示无网格的原始截图(点击换算不受影响)。"""
+        if self._grid_on.get():
+            self._render_canvas(self.grid_bgr)
+        elif self._latest_raw is not None:
+            self._render_canvas(self._latest_raw)
+        else:
+            self._log("[提示] 暂无无网格原图,保持当前显示")
 
-        ttk.Button(right, text="删除选中", command=self._delete_selected).grid(row=4, column=0, sticky="ew", pady=2)
-        ttk.Button(right, text="上移", command=lambda: self._move(-1)).grid(row=4, column=1, sticky="ew", pady=2)
-        ttk.Button(right, text="下移", command=self._move(1)).grid(row=4, column=2, sticky="ew", pady=2)
-        ttk.Button(right, text="清空", command=self._clear).grid(row=5, column=0, sticky="ew", pady=2)
-        ttk.Button(right, text="保存脚本", command=self._save).grid(row=5, column=1, sticky="ew", pady=2)
-        ttk.Button(right, text="加载脚本", command=self._load).grid(row=5, column=2, sticky="ew", pady=2)
+    def _zoom(self, factor: float) -> None:
+        """缩放画布显示。self.scale 同时用于点击坐标换算,故缩放后点击依旧准确。"""
+        base_h, base_w = self.grid_bgr.shape[:2]
+        new_scale = min(2.0, max(0.2, self.scale * factor))
+        self.scale = new_scale
+        self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
+        self._zoom_label.configure(text=f"{int(round(new_scale * 100))}%")
 
-        ttk.Button(right, text="⟳ 刷新截图", command=self._refresh).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=2)
-        self._auto_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(right, text="自动刷新(1秒)", variable=self._auto_var).grid(
-            row=6, column=2, sticky="w", padx=4)
+    def _zoom_reset(self) -> None:
+        """回到 1:1(按当前网格图原始像素 1:1 显示,超出部分由画布裁切)。"""
+        self.scale = 1.0
+        self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
+        self._zoom_label.configure(text="100%")
 
-        self.run_btn = ttk.Button(right, text="▶ 运行", command=self._run)
-        self.run_btn.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
-        self.full_run_btn = ttk.Button(right, text="🎬 完整运行", command=self._full_run)
-        self.full_run_btn.grid(row=7, column=2, sticky="ew", pady=(8, 2), padx=(2, 0))
+    def _render_canvas(self, bgr) -> None:
+        """按当前 self.scale 把 bgr 渲染到画布(PhotoImage 不支持任意缩放,先落盘再加载)。
 
-        # 右下:执行日志
-        ttk.Label(right, text="执行日志:").grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self.log_text = tk.Text(right, width=42, height=10, font=("Consolas", 9),
-                                state="disabled", bg="#111", fg="#0f0")
-        self.log_text.grid(row=9, column=0, columnspan=3, pady=2)
-
-        # ---- Tab 2: AI 模式(对话式步骤编排) ----
-        ai_tab = ttk.Frame(self.notebook, padding=(10, 0, 0, 0))
-        self.notebook.add(ai_tab, text="AI 模式")
-        # 切回普通模式时恢复纯网格,避免候选框干扰手动点格
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        ttk.Label(ai_tab, text="AI 对话").grid(row=0, column=0, columnspan=2, sticky="w")
-        self._ai_chat = tk.Text(ai_tab, width=44, height=20, font=("Consolas", 10),
-                                state="disabled", bg="#1a1a2e", fg="#e0e0e0",
-                                wrap="word", relief="sunken", bd=2)
-        self._ai_chat.grid(row=1, column=0, columnspan=2, pady=4)
-        ai_scroll = ttk.Scrollbar(ai_tab, orient="vertical", command=self._ai_chat.yview)
-        ai_scroll.grid(row=1, column=2, sticky="ns")
-        self._ai_chat.configure(yscrollcommand=ai_scroll.set)
-        # 消息着色:AI 蓝色,用户绿色
-        self._ai_chat.tag_configure("ai", foreground="#6ea8fe")
-        self._ai_chat.tag_configure("user", foreground="#6eff6e")
-
-        ttk.Label(ai_tab, text="输入指令(如:点击kof图标):").grid(
-            row=2, column=0, sticky="w", pady=(6, 0))
-        # 定位模式:全流程 / 仅OCR / 仅VLM(调试用)
-        self._ai_mode_var = tk.StringVar(value="全流程")
-        ttk.Combobox(ai_tab, textvariable=self._ai_mode_var,
-                     values=["全流程", "仅OCR", "仅VLM"], width=8,
-                     state="readonly").grid(row=2, column=1, sticky="e", pady=(6, 0))
-
-        self._ai_input_var = tk.StringVar()
-        ai_entry = ttk.Entry(ai_tab, textvariable=self._ai_input_var, width=34)
-        ai_entry.grid(row=3, column=0, sticky="ew", pady=2)
-        ai_entry.bind("<Return>", lambda e: self._ai_send())
-        ttk.Button(ai_tab, text="发送", command=self._ai_send).grid(
-            row=3, column=1, sticky="w", padx=4)
-
-        # 确认/否认/换候选按钮(初始隐藏,AI 提议后显示)
-        self._ai_confirm_btn = ttk.Button(ai_tab, text="✓ 保存为步骤",
-                                         command=self._ai_confirm)
-        self._ai_deny_btn = ttk.Button(ai_tab, text="✗ 不是",
-                                       command=lambda: self._ai_cycle_candidate(1))
-        self._ai_next_btn = ttk.Button(ai_tab, text="⇄ 换候选",
-                                       command=lambda: self._ai_cycle_candidate(1))
-        self._ai_confirm_btn.grid(row=4, column=0, sticky="ew", pady=(6, 2))
-        self._ai_deny_btn.grid(row=4, column=1, sticky="ew", pady=(6, 2), padx=(2, 0))
-        self._ai_next_btn.grid(row=4, column=2, sticky="ew", pady=(6, 2), padx=(2, 0))
-        self._ai_confirm_btn.grid_remove()
-        self._ai_deny_btn.grid_remove()
-        self._ai_next_btn.grid_remove()
-
-        # 候选信息(来源/置信度/验证状态)
-        self._ai_cand_info_var = tk.StringVar(value="")
-        ttk.Label(ai_tab, textvariable=self._ai_cand_info_var,
-                  foreground="#444", wraplength=300, justify="left").grid(
-            row=5, column=0, columnspan=3, sticky="w")
-
-        # AI 模式也放运行按钮(共享 steps 列表)
-        ttk.Button(ai_tab, text="⟳ 刷新截图", command=self._refresh).grid(
-            row=6, column=0, columnspan=3, sticky="ew", pady=2)
-        ttk.Button(ai_tab, text="▶ 运行脚本", command=self._run).grid(
-            row=7, column=0, columnspan=3, sticky="ew", pady=(8, 2))
-
-        # AI 模式日志
-        ttk.Label(ai_tab, text="AI 模式日志(含 AI 思考过程):").grid(
-            row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self._ai_log_text = tk.Text(ai_tab, width=42, height=16, font=("Consolas", 9),
-                                    state="disabled", bg="#111", fg="#0f0", wrap="word")
-        self._ai_log_text.grid(row=9, column=0, columnspan=2, pady=2)
-        ai_log_scroll = ttk.Scrollbar(ai_tab, orient="vertical",
-                                      command=self._ai_log_text.yview)
-        ai_log_scroll.grid(row=9, column=2, sticky="ns")
-        self._ai_log_text.configure(yscrollcommand=ai_log_scroll.set)
-
-        # 最右:当前步骤的标准图(执行前/执行后)+ 步骤详情,两种模式共享
-        preview = ttk.Frame(root, padding=(10, 0, 0, 0))
-        preview.grid(row=0, column=2, sticky="n")
-
-        # ---- 步骤详情:选中列表步骤后在此展示,可直接修改前/后等待时间 ----
-        self._preview_index: Optional[int] = None  # 当前详情面板对应的步骤下标
-        ttk.Label(preview, text="步骤详情").grid(row=0, column=0, columnspan=2, sticky="w")
-        self._detail_info_var = tk.StringVar(value="未选中步骤")
-        ttk.Label(preview, textvariable=self._detail_info_var,
-                  foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        waits_frm = ttk.Frame(preview)
-        waits_frm.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        ttk.Label(waits_frm, text="前等待").pack(side="left")
-        self._detail_before_var = tk.StringVar(value="0")
-        ttk.Spinbox(waits_frm, from_=0, to=600, width=5,
-                    textvariable=self._detail_before_var).pack(side="left")
-        ttk.Label(waits_frm, text="s  后等待").pack(side="left")
-        self._detail_after_var = tk.StringVar(value="0")
-        ttk.Spinbox(waits_frm, from_=0, to=600, width=5,
-                    textvariable=self._detail_after_var).pack(side="left")
-        ttk.Label(waits_frm, text="s").pack(side="left")
-        ttk.Button(waits_frm, text="保存", command=self._apply_step_detail).pack(
-            side="left", padx=(6, 0))
-
-        ttk.Label(preview, text="当前步骤标准图").grid(row=3, column=0, columnspan=2, sticky="w",
-                                                        pady=(8, 0))
-
-        ttk.Label(preview, text="执行前(开始条件):").grid(row=4, column=0, columnspan=2, sticky="w",
-                                                           pady=(6, 0))
-        self._before_photo = self._make_placeholder_image()
-        self.before_img_label = tk.Label(
-            preview, image=self._before_photo,
-            width=EXPECT_IMG_W, height=EXPECT_IMG_H,
-            highlightthickness=1, highlightbackground="#555", bg="#222")
-        self.before_img_label.grid(row=5, column=0, columnspan=2, pady=2)
-        self.before_status_var = tk.StringVar(value="未选中步骤")
-        ttk.Label(preview, textvariable=self.before_status_var,
-                  foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
-            row=6, column=0, columnspan=2, sticky="w")
-
-        ttk.Label(preview, text="执行后(完成条件):").grid(row=7, column=0, columnspan=2, sticky="w",
-                                                           pady=(6, 0))
-        self._after_photo = self._make_placeholder_image()
-        self.after_img_label = tk.Label(
-            preview, image=self._after_photo,
-            width=EXPECT_IMG_W, height=EXPECT_IMG_H,
-            highlightthickness=1, highlightbackground="#555", bg="#222")
-        self.after_img_label.grid(row=8, column=0, columnspan=2, pady=2)
-        self.after_status_var = tk.StringVar(value="未选中步骤")
-        ttk.Label(preview, textvariable=self.after_status_var,
-                  foreground="#666", wraplength=EXPECT_IMG_W, justify="left").grid(
-            row=9, column=0, columnspan=2, sticky="w")
-
-        ttk.Button(preview, text="📷 重拍执行前图",
-                   command=lambda: self._recapture_anchor("before_image")).grid(
-            row=10, column=0, sticky="ew", pady=(6, 2), padx=(0, 2))
-        ttk.Button(preview, text="📷 截执行后图",
-                   command=lambda: self._recapture_anchor("after_image")).grid(
-            row=10, column=1, sticky="ew", pady=(6, 2), padx=(2, 0))
+        注意:先 create_image 再赋 self.photo,并保留旧引用,
+        否则旧 PhotoImage 被 GC 时 Tcl 侧图片同步销毁,画布会闪黑图(实测踩过)。
+        """
+        import tempfile
+        if bgr is None:
+            return
+        h, w = bgr.shape[:2]
+        self.disp_w, self.disp_h = max(1, int(w * self.scale)), max(1, int(h * self.scale))
+        disp = cv2.resize(bgr, (self.disp_w, self.disp_h), interpolation=cv2.INTER_AREA)
+        self._tmp = os.path.join(tempfile.gettempdir(), "grapemobile_grid_display.png")
+        cv2.imwrite(self._tmp, disp)
+        new_photo = tk.PhotoImage(file=self._tmp)
+        old_photo = getattr(self, "photo", None)
+        self.canvas.configure(width=self.disp_w, height=self.disp_h)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=new_photo)
+        self.photo = new_photo
+        self._photo_ref = old_photo  # 保持引用,避免画布闪黑
 
     # ------------------------------------------------------------------
     # 步骤编辑
@@ -835,7 +1584,7 @@ class StepApp(tk.Tk):
         self.steps.append(step)
         self._refresh_list()
         self._select_and_preview(len(self.steps) - 1)
-        self.listbox.see("end")
+        self._list_see_end()
 
     def _anchor_dir(self) -> str:
         """当前脚本的标准图目录:scripts/<脚本名>/images/。"""
@@ -916,7 +1665,7 @@ class StepApp(tk.Tk):
         """
         if self._running:
             return
-        sel = self.listbox.curselection()
+        sel = self._list_sel()
         if len(sel) != 1:
             messagebox.showinfo("请选择步骤", "请先在步骤列表中选中一个步骤。")
             return
@@ -970,6 +1719,103 @@ class StepApp(tk.Tk):
         setattr(self, photo_attr, photo)
         label.configure(image=photo)
 
+    # 系统操作选项:显示文案 -> (类型, 附加参数)
+    _SYSOP_OPTIONS = (
+        ("关闭 App(force-stop)", ("app_stop", "")),
+        ("启动 App", ("app_start", "")),
+        ("清除 App 数据(pm clear)", ("app_clear", "")),
+        ("Home 键", ("keyevent", "home")),
+        ("返回键", ("keyevent", "back")),
+        ("最近任务键", ("keyevent", "recents")),
+    )
+
+    def _add_system_step(self) -> None:
+        """弹窗选择系统操作(App 生命周期/系统按键)并追加为步骤。"""
+        if self._running:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("添加系统操作")
+        dlg.resizable(False, False)
+        dlg.transient(self.winfo_toplevel())
+
+        ttk.Label(dlg, text="操作:").grid(row=0, column=0, padx=(12, 4),
+                                          pady=(12, 4), sticky="e")
+        labels = [o[0] for o in self._SYSOP_OPTIONS]
+        op_var = tk.StringVar(value=labels[0])
+        ttk.Combobox(dlg, textvariable=op_var, values=labels,
+                     state="readonly", width=24).grid(
+            row=0, column=1, columnspan=2, padx=(0, 12), pady=(12, 4))
+
+        pkg_frm = ttk.Frame(dlg)
+        pkg_frm.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=4)
+        ttk.Label(pkg_frm, text="包名(留空=执行时\n自动识别前台App):").pack(side="left")
+        pkg_var = tk.StringVar()
+        ttk.Entry(pkg_frm, textvariable=pkg_var, width=22).pack(
+            side="left", padx=4)
+
+        def _detect_pkg() -> None:
+            if not self.device_id:
+                messagebox.showinfo("无设备", "当前未连接设备,无法识别包名", parent=dlg)
+                return
+            try:
+                c = AdbClient()
+                c.attach(self.device_id)
+                pkg_var.set(c.current_package())
+            except Exception as exc:
+                messagebox.showerror("识别失败", str(exc), parent=dlg)
+
+        ttk.Button(pkg_frm, text="识别当前", command=_detect_pkg).pack(side="left")
+
+        # keyevent 选项隐藏包名行,app 操作显示
+        def _sync_pkg_row(_event=None) -> None:
+            choice = dict((o[0], o[1]) for o in self._SYSOP_OPTIONS)[op_var.get()]
+            if choice[0] == "keyevent":
+                pkg_frm.grid_remove()
+            else:
+                pkg_frm.grid()
+
+        dlg.bind("<<ComboboxSelected>>", _sync_pkg_row)
+
+        def _ok() -> None:
+            stype, arg = dict((o[0], o[1]) for o in self._SYSOP_OPTIONS)[op_var.get()]
+            if stype == "keyevent":
+                step = {"type": "keyevent", "key": arg}
+            else:
+                step = {"type": stype, "package": pkg_var.get().strip()}
+            step.update({
+                "cell": "", "x": None, "y": None,
+                "delay_before": 0,
+                "wait_after": 2 if stype in APP_OP_TYPES else 0,
+                "before_image": "", "after_image": "", "desc": "",
+            })
+            self.steps.append(step)
+            self._refresh_list()
+            self._select_and_preview(len(self.steps) - 1)
+            self._list_see_end()
+            self._log(f"[添加] {self._step_action_text(step)}")
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=2, column=0, columnspan=3, pady=(8, 12))
+        ttk.Button(btns, text="添加", command=_ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda _e: _ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+
+    @staticmethod
+    def _step_action_text(step: Dict[str, Any]) -> str:
+        """步骤的人类可读动作文案(日志/列表共用)。"""
+        stype = step.get("type")
+        if stype == "keyevent":
+            return f"系统按键 {KEYEVENT_LABELS.get(step.get('key'), step.get('key'))}"
+        if stype in APP_OP_TYPES:
+            action = {"app_stop": "关闭 App", "app_start": "启动 App",
+                      "app_clear": "清除 App 数据"}[stype]
+            pkg = step.get("package") or "自动识别前台 App"
+            return f"{action}: {pkg}"
+        return f"{stype} {step.get('cell')}"
+
     def _show_expect_preview(self, index: Optional[int]) -> None:
         """
         显示指定步骤的执行前/执行后标准图。
@@ -988,10 +1834,24 @@ class StepApp(tk.Tk):
 
         self._preview_index = index
         step = self.steps[index]
+        stype = step.get("type")
+
+        # ---- 非 UI 步骤:无格子/标准图,详情展示动作与包名/按键 ----
+        if stype in APP_OP_TYPES or stype == "keyevent":
+            title = f"第 {index + 1} 步"
+            self._detail_info_var.set(f"{title}  {self._step_action_text(step)}")
+            self._detail_before_var.set(f"{step.get('delay_before', 0):g}")
+            self._detail_after_var.set(f"{step.get('wait_after', 0):g}")
+            self._set_preview_image("before", None)
+            self._set_preview_image("after", None)
+            self.before_status_var.set(f"{title}\n系统操作,无标准图")
+            self.after_status_var.set(f"{title}\n系统操作,无标准图")
+            return
+
         title = f"第 {index + 1} 步 {step['cell']}"
 
         # ---- 步骤详情(可编辑前/后等待) ----
-        is_input = step.get("type") == "input"
+        is_input = stype == "input"
         kind = f"输入 \"{step.get('text', '')}\"" if is_input else "点击"
         coord = (f"({step['x']}, {step['y']})"
                  if step.get("x") is not None and step.get("y") is not None else "-")
@@ -1040,9 +1900,24 @@ class StepApp(tk.Tk):
         except ValueError:
             return 0.0
 
+    def _list_sel(self) -> List[int]:
+        """当前选中步骤下标列表(Treeview 版 curselection)。"""
+        return [int(iid) for iid in self.listbox.selection()]
+
+    def _list_select(self, i: int) -> None:
+        """程序化选中第 i 步并滚动到可见。"""
+        self.listbox.selection_set(str(i))
+        self.listbox.see(str(i))
+
+    def _list_see_end(self) -> None:
+        """滚动到列表末行(新增步骤后调用)。"""
+        kids = self.listbox.get_children()
+        if kids:
+            self.listbox.see(kids[-1])
+
     def _on_select(self, _event: tk.Event) -> None:
         """选中步骤时显示其预期画面。"""
-        sel = self.listbox.curselection()
+        sel = self._list_sel()
         if len(sel) == 1:
             self._show_expect_preview(sel[0])
 
@@ -1066,43 +1941,77 @@ class StepApp(tk.Tk):
     def _on_step_double_click(self, event: tk.Event) -> None:
         """双击列表行:弹窗直接修改该步骤的前/后等待时间。"""
         # 以双击位置为准确定行(双击时选中事件可能尚未更新)
-        i = self.listbox.nearest(event.y)
+        iid = self.listbox.identify_row(event.y)
+        if not iid:
+            return
+        i = int(iid)
         if not (0 <= i < len(self.steps)):
             return
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set(i)
+        self.listbox.selection_set(iid)
         self._edit_step_waits(i)
 
     def _edit_step_waits(self, i: int) -> None:
-        """小弹窗编辑第 i 步的 delay_before / wait_after。"""
+        """小弹窗编辑第 i 步:系统操作步骤可改包名/按键,所有步骤可改前/后等待。"""
         step = self.steps[i]
+        stype = step.get("type")
+        is_sysop = stype in APP_OP_TYPES or stype == "keyevent"
         dlg = tk.Toplevel(self)
-        dlg.title(f"第 {i + 1} 步 - 等待时间")
+        dlg.title(f"第 {i + 1} 步 - {self._step_action_text(step)}")
         dlg.resizable(False, False)
         dlg.transient(self.winfo_toplevel())
 
-        ttk.Label(dlg, text="执行前等待(秒):").grid(row=0, column=0, padx=10, pady=(12, 4), sticky="e")
+        row = 0
+        if is_sysop:
+            if stype == "keyevent":
+                ttk.Label(dlg, text="按键:").grid(row=row, column=0, padx=10,
+                                                   pady=(12, 4), sticky="e")
+                key_var = tk.StringVar(value=step.get("key", "home"))
+                ttk.Combobox(dlg, textvariable=key_var,
+                             values=list(KEYEVENT_MAP), state="readonly",
+                             width=10).grid(row=row, column=1, padx=10,
+                                            pady=(12, 4), sticky="w")
+            else:
+                ttk.Label(dlg, text="包名(留空=\n自动识别):").grid(
+                    row=row, column=0, padx=10, pady=(12, 4), sticky="e")
+                pkg_var = tk.StringVar(value=step.get("package", ""))
+                ttk.Entry(dlg, textvariable=pkg_var, width=20).grid(
+                    row=row, column=1, padx=10, pady=(12, 4), sticky="w")
+            row += 1
+
+        ttk.Label(dlg, text="执行前等待(秒):").grid(
+            row=row, column=0, padx=10, pady=(12, 4) if row == 0 else 4,
+            sticky="e")
         before_var = tk.StringVar(value=f"{step.get('delay_before', 0):g}")
         ttk.Spinbox(dlg, from_=0, to=600, width=8, textvariable=before_var).grid(
-            row=0, column=1, padx=10, pady=(12, 4))
-        ttk.Label(dlg, text="执行后等待(秒):").grid(row=1, column=0, padx=10, pady=4, sticky="e")
+            row=row, column=1, padx=10, pady=(12, 4) if row == 0 else 4,
+            sticky="w")
+        row += 1
+        ttk.Label(dlg, text="执行后等待(秒):").grid(row=row, column=0, padx=10,
+                                                    pady=4, sticky="e")
         after_var = tk.StringVar(value=f"{step.get('wait_after', 0):g}")
         ttk.Spinbox(dlg, from_=0, to=600, width=8, textvariable=after_var).grid(
-            row=1, column=1, padx=10, pady=4)
+            row=row, column=1, padx=10, pady=4, sticky="w")
+        row += 1
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=2, column=0, columnspan=2, pady=(8, 12))
+        btns.grid(row=row, column=0, columnspan=2, pady=(8, 12))
 
         def _ok() -> None:
             # 强制焦点提交 Spinbox 正在编辑的值
             dlg.focus_set()
             dlg.update_idletasks()
+            if is_sysop:
+                if stype == "keyevent":
+                    step["key"] = key_var.get()
+                else:
+                    step["package"] = pkg_var.get().strip()
             step["delay_before"] = self._spin_value(before_var)
             step["wait_after"] = self._spin_value(after_var)
             self._refresh_list()
-            self.listbox.selection_set(i)
-            self.listbox.see(i)
-            self._log(f"[修改] 第 {i + 1} 步等待: 前 {step['delay_before']:g}s / 后 {step['wait_after']:g}s")
+            self._list_select(i)
+            self._show_expect_preview(i)
+            self._log(f"[修改] 第 {i + 1} 步 {self._step_action_text(step)}:"
+                      f" 前 {step['delay_before']:g}s / 后 {step['wait_after']:g}s")
             dlg.destroy()
 
         ttk.Button(btns, text="确定", command=_ok).pack(side="left", padx=6)
@@ -1112,16 +2021,31 @@ class StepApp(tk.Tk):
         dlg.grab_set()  # 模态
 
     def _select_and_preview(self, index: Optional[int]) -> None:
-        """程序化选中某步并刷新预期画面(selection_set 不触发 <<ListboxSelect>>)。"""
-        self.listbox.selection_clear(0, "end")
+        """程序化选中某步并刷新预期画面(selection_set 不触发 <<TreeviewSelect>>)。"""
+        self.listbox.selection_remove(self.listbox.selection())
         if index is not None and 0 <= index < len(self.steps):
-            self.listbox.selection_set(index)
+            self._list_select(index)
             self._show_expect_preview(index)
         else:
             self._show_expect_preview(None)
 
+    def _select_card(self, index: int) -> None:
+        """点击步骤卡片:选中并显示预览,同步高亮两处卡片。"""
+        self._select_and_preview(index)
+        self._refresh_step_cards()
+        self._refresh_normal_cards()
+
+    def _delete_step(self, index: int) -> None:
+        """删除指定步骤(卡片右上角 ✕)。"""
+        if not (0 <= index < len(self.steps)):
+            return
+        del self.steps[index]
+        self._refresh_list()
+        nxt = min(index, len(self.steps) - 1) if self.steps else None
+        self._select_and_preview(nxt)
+
     def _delete_selected(self) -> None:
-        sel = list(self.listbox.curselection())
+        sel = self._list_sel()
         for i in reversed(sel):
             del self.steps[i]
         self._refresh_list()
@@ -1130,7 +2054,7 @@ class StepApp(tk.Tk):
         self._select_and_preview(nxt)
 
     def _move(self, delta: int) -> None:
-        sel = self.listbox.curselection()
+        sel = self._list_sel()
         if len(sel) != 1:
             return
         i = sel[0]
@@ -1146,27 +2070,166 @@ class StepApp(tk.Tk):
         self._select_and_preview(None)
 
     def _refresh_list(self) -> None:
-        self.listbox.delete(0, "end")
-        for i, step in enumerate(self.steps, 1):
+        """重建步骤列表(Treeview 紧凑行:编号/操作/目标/等待)与中栏步骤卡片。"""
+        self.listbox.delete(*self.listbox.get_children())
+        for i, step in enumerate(self.steps):
             before_wait = step.get("delay_before", 0)
             after_wait = step.get("wait_after", 0)
-            # 全信息显示:每行都带前/后等待时间
-            suffix = f"  (前{before_wait:g}s/后{after_wait:g}s)"
-            marks = ""
-            if step.get("before_image"):
-                marks += " ▶"  # 有执行前标准图
-            if step.get("after_image"):
-                marks += " ⏹"  # 有执行后标准图
-            if step.get("x") is not None and step.get("y") is not None:
-                marks += " 🎯"  # AI 精确定位(带像素坐标)
-            if step.get("type") == "input":
-                label = f"{i:2d}. 输入 {step['cell']} \"{step.get('text', '')}\"{marks}{suffix}"
-            else:
-                label = f"{i:2d}. 点击 {step['cell']}{marks}{suffix}"
+            waits = f"前{before_wait:g}/后{after_wait:g}"
+            stype = step.get("type")
             desc = (step.get("desc") or "").strip()
-            if desc:
-                label += f"  [{desc}]"
-            self.listbox.insert("end", label)
+            tags = ["odd" if i % 2 else "even"]
+            if stype == "input":
+                title = desc or "输入文本"
+                meta = f"{step['cell']} \"{step.get('text', '')}\""
+            elif stype in APP_OP_TYPES or stype == "keyevent":
+                title = self._step_action_text(step)
+                meta = "系统操作"
+                tags.append("sysop")
+            else:
+                title = desc or "点击"
+                cell = step.get("cell", "")
+                x, y = step.get("x"), step.get("y")
+                meta = f"{cell}" + (f"({x},{y})" if x is not None and y is not None else "")
+            self.listbox.insert("", "end", iid=str(i), tags=tags,
+                                 values=(i + 1, title, meta, waits))
+        # 同步刷新中栏步骤卡片与右栏普通模式紧凑卡片
+        self._refresh_step_cards()
+        self._refresh_normal_cards()
+
+    def _refresh_step_cards(self) -> None:
+        """重建中栏步骤卡片列表(Canvas 滚动区 + 每张卡片一个 Frame)。"""
+        for child in self._step_cards_inner.winfo_children():
+            child.destroy()
+        if not self.steps:
+            tk.Label(self._step_cards_inner, text="(暂无步骤,点击左侧画面添加)",
+                     fg=THEME["txt3"], bg=THEME["surface"],
+                     font=FONT_CAPTION).pack(pady=20)
+            return
+        for i, step in enumerate(self.steps):
+            card = tk.Frame(self._step_cards_inner, bg=THEME["bg2"],
+                            highlightthickness=1, highlightbackground=THEME["border"])
+            card.pack(fill="x", pady=(0, 6), padx=1)
+            # 选中态高亮
+            if self._preview_index == i:
+                card.configure(highlightbackground=THEME["accent"],
+                               highlightthickness=2)
+            # 编号徽章(圆角)
+            num = _RoundedBadge(card, text=str(i + 1), size=22, radius=5)
+            num.grid(row=0, column=0, rowspan=2, padx=6, pady=6, sticky="n")
+            # 主体
+            body = tk.Frame(card, bg=THEME["bg2"])
+            body.grid(row=0, column=1, sticky="ew", pady=(6, 0))
+            card.grid_columnconfigure(1, weight=1)
+            stype = step.get("type")
+            desc = (step.get("desc") or "").strip()
+            if stype == "input":
+                ttl = desc or f"输入 \"{step.get('text', '')}\""
+            elif stype in APP_OP_TYPES or stype == "keyevent":
+                ttl = self._step_action_text(step)
+            else:
+                ttl = desc or f"点击 {step.get('cell', '')}"
+            tk.Label(body, text=ttl, fg=THEME["txt"], bg=THEME["bg2"],
+                     font=FONT_UI, anchor="w").pack(side="left", fill="x", expand=True)
+            # 锚点标记
+            has_anchor = step.get("before_image") or step.get("after_image")
+            if has_anchor:
+                tk.Label(body, text="◎锚点", fg=THEME["accent"], bg=THEME["bg2"],
+                         font=FONT_CAPTION).pack(side="left", padx=(4, 0))
+            # 副标题(格子/坐标/系统操作)
+            sub = tk.Frame(card, bg=THEME["bg2"])
+            sub.grid(row=1, column=1, sticky="w", padx=(0, 6), pady=(2, 0))
+            if stype == "input":
+                sub_text = f"格子 {step.get('cell', '')}"
+            elif stype in APP_OP_TYPES or stype == "keyevent":
+                sub_text = "系统操作"
+            else:
+                x, y = step.get("x"), step.get("y")
+                sub_text = f"格子 {step.get('cell', '')}" + (
+                    f" · ({x},{y})" if x is not None and y is not None else "")
+            tk.Label(sub, text=sub_text, fg=THEME["txt2"], bg=THEME["bg2"],
+                     font=FONT_MONO, anchor="w").pack(side="left")
+            # 等待 chip
+            meta = tk.Frame(card, bg=THEME["bg2"])
+            meta.grid(row=2, column=1, sticky="w", padx=(0, 6), pady=(4, 6))
+            tk.Label(meta, text=f"前{step.get('delay_before', 0):g}s",
+                     fg=THEME["txt2"], bg=THEME["surface2"], font=FONT_MONO,
+                     padx=4, pady=1).pack(side="left", padx=(0, 4))
+            tk.Label(meta, text=f"后{step.get('wait_after', 0):g}s",
+                     fg=THEME["txt2"], bg=THEME["surface2"], font=FONT_MONO,
+                     padx=4, pady=1).pack(side="left")
+            # 操作按钮(上移/下移/删除):24x24 圆角小方块
+            acts = tk.Frame(card, bg=THEME["bg2"])
+            acts.grid(row=0, column=2, rowspan=3, padx=(0, 6), pady=6, sticky="ne")
+            for icon, cmd in [
+                ("△", lambda idx=i: self._move(-1)),
+                ("▽", lambda idx=i: self._move(1)),
+                ("✕", lambda idx=i: self._delete_step(idx)),
+            ]:
+                _RoundedButton(acts, text=icon, command=cmd,
+                               width=24, height=24, radius=5).pack(side="left", padx=1)
+            # 交互:点击卡片选中;双击改等待
+            for w in (card, body, sub, meta, num):
+                w.bind("<Button-1>", lambda _e, idx=i: self._select_card(idx))
+                w.bind("<Double-Button-1>", lambda _e, idx=i: self._edit_step_waits(idx))
+
+    def _refresh_normal_cards(self) -> None:
+        """重建右栏普通模式的紧凑步骤卡片(nstep:编号+标题+副标题+上移/下移/删除)。"""
+        for child in self._normal_inner.winfo_children():
+            child.destroy()
+        if not self.steps:
+            tk.Label(self._normal_inner, text="(暂无步骤)",
+                     fg=THEME["txt3"], bg=THEME["surface"],
+                     font=FONT_CAPTION).pack(pady=16)
+            return
+        for i, step in enumerate(self.steps):
+            stype = step.get("type")
+            desc = (step.get("desc") or "").strip()
+            if stype == "input":
+                ttl = desc or f"输入 \"{step.get('text', '')}\""
+            elif stype in APP_OP_TYPES or stype == "keyevent":
+                ttl = self._step_action_text(step)
+            else:
+                ttl = desc or f"点击 {step.get('cell', '')}"
+            # 副标题
+            if stype == "input":
+                sub = f"格子 {step.get('cell', '')}"
+            elif stype in APP_OP_TYPES or stype == "keyevent":
+                sub = "系统操作"
+            else:
+                x, y = step.get("x"), step.get("y")
+                sub = f"格子 {step.get('cell', '')}" + (
+                    f" · ({x},{y})" if x is not None and y is not None else "")
+            selected = (self._preview_index == i)
+            card = tk.Frame(self._normal_inner, bg=THEME["bg2"],
+                            highlightthickness=1,
+                            highlightbackground=THEME["accent"] if selected else THEME["border"])
+            card.pack(fill="x", pady=(0, 6))
+            card.columnconfigure(1, weight=1)  # 主体列自动伸缩
+            # 编号徽章(圆角)
+            num = _RoundedBadge(card, text=str(i + 1), size=22, radius=5)
+            num.grid(row=0, column=0, rowspan=2, padx=(6, 8), pady=8, sticky="w")
+            # 主体
+            body = tk.Frame(card, bg=THEME["bg2"])
+            body.grid(row=0, column=1, rowspan=2, sticky="ew", pady=7)
+            tk.Label(body, text=ttl, bg=THEME["bg2"], fg=THEME["txt"],
+                     font=FONT_UI_BOLD, anchor="w").pack(fill="x")
+            tk.Label(body, text=sub, bg=THEME["bg2"], fg=THEME["txt2"],
+                     font=FONT_MONO, anchor="w").pack(fill="x", pady=(1, 0))
+            # 操作图标按钮(上移/下移/删除):24x24 圆角小方块
+            acts = tk.Frame(card, bg=THEME["bg2"])
+            acts.grid(row=0, column=2, rowspan=2, padx=(4, 6), pady=6, sticky="e")
+            for icon, cmd in [
+                ("△", lambda idx=i: self._move(-1)),
+                ("▽", lambda idx=i: self._move(1)),
+                ("✕", lambda idx=i: self._delete_step(idx)),
+            ]:
+                _RoundedButton(acts, text=icon, command=cmd,
+                               width=24, height=24, radius=5).pack(side="left", padx=1)
+            # 点击卡片选中(同步 listbox 选中态,触发预览)
+            for w in (card, num, body):
+                w.bind("<Button-1>", lambda _e, idx=i: self._select_card(idx))
+                w.bind("<Double-Button-1>", lambda _e, idx=i: self._edit_step_waits(idx))
 
     def _refresh(self) -> None:
         """重新从设备截取当前画面并刷新网格显示(步骤列表保留)。"""
@@ -1322,12 +2385,15 @@ class StepApp(tk.Tk):
         )
         if not path:
             return
-        path = os.path.abspath(path)
+        self._load_script(os.path.abspath(path))
+
+    def _load_script(self, path: str) -> bool:
+        """加载指定脚本 JSON 到普通模式(执行模式"加载到普通模式"复用)。成功返回 True。"""
         try:
             self.steps = load_steps(path)
         except StepError as exc:
             messagebox.showerror("加载失败", str(exc))
-            return
+            return False
         # 切换当前脚本:锚点文件夹与 JSON 同名,锚点相对路径以 JSON 所在目录为基准
         self.script_path = path
         self.script_name = os.path.splitext(os.path.basename(path))[0]
@@ -1342,6 +2408,7 @@ class StepApp(tk.Tk):
         self._log(f"脚本已加载: {path}(共 {len(self.steps)} 步)")
         if missing:
             self._log(f"[提示] {len(missing)} 张标准图缺失,对应位置将跳过画面校验/退化为固定等待")
+        return True
 
     # ------------------------------------------------------------------
     # 运行
@@ -1353,7 +2420,7 @@ class StepApp(tk.Tk):
             messagebox.showwarning("无步骤", "请先在左侧图片上点击格子添加步骤")
             return
         # 选中且仅选中一个步骤时:只执行该步;否则从头顺序执行全部
-        sel = self.listbox.curselection()
+        sel = self._list_sel()
         if len(sel) == 1:
             self._run_offset = sel[0]
             run_steps = [self.steps[sel[0]]]
@@ -1450,6 +2517,254 @@ class StepApp(tk.Tk):
             err_msg = str(exc)
             self._bridge.post(lambda m=err_msg: self._log(f"[回放] 渲染失败: {m}"))
 
+    # ------------------------------------------------------------------
+    # 执行模式(测试计划:批量勾选 scripts 下的用例执行)
+    # ------------------------------------------------------------------
+    def _exec_log(self, msg: str) -> None:
+        """写入执行模式日志区。"""
+        self._exec_log_text.configure(state="normal")
+        self._exec_log_text.insert("end", msg + "\n")
+        self._exec_log_text.see("end")
+        self._exec_log_text.configure(state="disabled")
+
+    def _exec_refresh(self) -> None:
+        """扫描 SCRIPTS_DIR(递归,支持多层文件夹):每个 JSON 文件视为一条用例。"""
+        self._exec_cases.clear()
+        if os.path.isdir(SCRIPTS_DIR):
+            for dirpath, dirnames, filenames in os.walk(SCRIPTS_DIR):
+                dirnames[:] = [d for d in dirnames if d != "images"]  # 跳过锚点图目录
+                for fn in sorted(filenames):
+                    if not fn.lower().endswith(".json"):
+                        continue
+                    path = os.path.abspath(os.path.join(dirpath, fn))
+                    self._exec_cases[path] = {
+                        "name": os.path.splitext(fn)[0],
+                        "path": path,
+                        "dir": dirpath,
+                        "rel": os.path.relpath(path, SCRIPTS_DIR),
+                    }
+        # 重建树(保留旧勾选状态)
+        checked = {iid for iid in self._exec_tree.get_children()
+                   if self._exec_tree.set(iid, "sel") == "☑"}
+        self._exec_tree.delete(*self._exec_tree.get_children())
+        for iid, case in self._exec_cases.items():
+            mark = "☑" if iid in checked else "☐"
+            self._exec_tree.insert("", "end", iid=iid, values=(
+                mark, case["name"], "待执行"))
+        self._exec_log(f"[用例] 扫描完成,共 {len(self._exec_cases)} 条"
+                       f"(目录: {SCRIPTS_DIR})")
+
+    def _on_exec_tree_click(self, event) -> None:
+        """点击用例行:右侧展示详情;点"选"或"用例"列同时切换勾选状态。"""
+        region = self._exec_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self._exec_tree.identify_column(event.x)
+        iid = self._exec_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._show_exec_case_detail(iid)
+        if col in ("#1", "#2"):  # 点"选"或"用例"列都可切换勾选
+            cur = self._exec_tree.set(iid, "sel")
+            self._exec_tree.set(iid, "sel", "☐" if cur == "☑" else "☑")
+
+    def _show_exec_case_detail(self, iid: str) -> None:
+        """执行模式:展示用例名称/路径/步骤摘要,并展开详情面板。"""
+        case = self._exec_cases.get(iid)
+        if case is None:
+            return
+        self._exec_detail_iid = iid
+        try:
+            steps = load_steps(case["path"])
+        except Exception as exc:
+            self._exec_detail_info.set(
+                f"用例: {case['name']} | 路径: {case['rel']} | 加载失败: {exc}")
+            steps = []
+        else:
+            self._exec_detail_info.set(
+                f"用例: {case['name']} | 路径: {case['rel']} | 共 {len(steps)} 步")
+        lines = []
+        for i, s in enumerate(steps, 1):
+            if s["type"] == "input":
+                action = f"输入[{s.get('text', '')}]"
+            elif s["type"] in APP_OP_TYPES or s["type"] == "keyevent":
+                action = self._step_action_text(s)
+            else:
+                action = f"点击 {s['cell']}"
+            desc = s.get("desc") or ""
+            lines.append(f"{i}. {action} 前{s['delay_before']}s/后{s['wait_after']}s"
+                         + (f"  {desc}" if desc else ""))
+        self._exec_detail_steps.configure(state="normal")
+        self._exec_detail_steps.delete("1.0", "end")
+        self._exec_detail_steps.insert("end", "\n".join(lines) if lines else "(无步骤)")
+        self._exec_detail_steps.configure(state="disabled")
+        self._exec_detail_frame.grid()  # 点击用例时展开详情
+
+    def _exec_load_to_normal(self) -> None:
+        """把执行模式当前详情的用例加载到普通模式并切换过去。"""
+        case = self._exec_cases.get(self._exec_detail_iid or "")
+        if case is None:
+            messagebox.showinfo("未选中用例", "请先在左侧列表点击一条用例")
+            return
+        if self._load_script(case["path"]):
+            self._switch_tab(1)  # 切到普通模式
+
+    def _exec_open_report(self) -> None:
+        """用系统资源管理器打开最近一次测试计划的结果目录。"""
+        if self._last_plan_dir and os.path.isdir(self._last_plan_dir):
+            os.startfile(self._last_plan_dir)  # Windows
+        else:
+            messagebox.showinfo("无报告", "尚未执行过测试计划")
+
+    def _exec_toggle_all(self) -> None:
+        """全选/全不选:有任一未勾选则全部勾选,否则全部取消。"""
+        iids = self._exec_tree.get_children()
+        target = "☐" if all(self._exec_tree.set(i, "sel") == "☑" for i in iids) else "☑"
+        for iid in iids:
+            self._exec_tree.set(iid, "sel", target)
+
+    def _exec_set_all(self, on: bool) -> None:
+        """全选(on=True)或全不选(on=False)。"""
+        target = "☑" if on else "☐"
+        for iid in self._exec_tree.get_children():
+            self._exec_tree.set(iid, "sel", target)
+
+    def _exec_set_status(self, iid: str, status: str) -> None:
+        self._exec_tree.set(iid, "status", status)
+
+    def _exec_checked(self) -> None:
+        """执行所有勾选用例:每次生成一个测试计划目录 runner/result/<plan-id>/。"""
+        if self._running or self._exec_busy:
+            return
+        checked = [iid for iid in self._exec_tree.get_children()
+                   if self._exec_tree.set(iid, "sel") == "☑"]
+        if not checked:
+            messagebox.showwarning("未选择用例", "请先勾选要执行的用例")
+            return
+        self._exec_busy = True
+        self._running = True  # 与普通模式运行互斥
+        self._exec_btn.configure(state="disabled")
+        plan_id = time.strftime("plan-%Y%m%d-%H%M%S")
+        plan_dir = os.path.join(RESULT_DIR, plan_id)
+        os.makedirs(plan_dir, exist_ok=True)
+        self._last_plan_dir = plan_dir
+        self._exec_log(f"[计划] {plan_id}:共 {len(checked)} 条用例,结果目录 {plan_dir}")
+        for iid in self._exec_tree.get_children():  # 重置所有状态列
+            self._exec_tree.set(iid, "status", "待执行")
+        threading.Thread(target=self._exec_worker,
+                         args=(checked, plan_dir, plan_id), daemon=True).start()
+
+    def _exec_worker(self, checked: List[str], plan_dir: str, plan_id: str) -> None:
+        """后台顺序执行勾选用例;每条用例录制+回放,最后写 plan.json 汇总。"""
+        results: List[Dict[str, Any]] = []
+        try:
+            runner = StepRunner.from_capture_artifacts(_BASE_DIR)
+        except Exception as exc:
+            err_msg = str(exc)
+            self._bridge.post(lambda m=err_msg: self._exec_log(f"[失败] 环境异常: {m}"))
+            self._bridge.post(lambda: self._exec_finished())
+            return
+        self._bridge.post(
+            lambda d=runner.device_id: self._exec_log(f"[设备] {d}"))
+
+        for seq, iid in enumerate(checked, 1):
+            case = self._exec_cases[iid]
+            name = case["name"]
+            self._bridge.post(lambda i=iid: self._exec_set_status(i, "执行中…"))
+            self._bridge.post(lambda n=name, s=seq, t=len(
+                checked): self._exec_log(f"—— [{s}/{t}] 用例 [{n}] 开始 ——"))
+            t0 = time.time()
+            rec = None
+            error: Optional[str] = None
+            rec_rel = replay_rel = ""
+            try:
+                steps = load_steps(case["path"])
+                if not steps:
+                    raise StepError("用例没有任何步骤")
+                from recording import Recorder
+                rec = Recorder.create(device_id=runner.device_id,
+                                      runs_dir=plan_dir, run_id=name)
+                rec_rel = os.path.relpath(rec.recording_path, plan_dir)
+                runner.script_dir = case["dir"]  # 锚点图以用例目录为基准
+                runner.run(steps,
+                           on_event=self._make_exec_event(name, len(steps)),
+                           recorder=rec)  # 异常时 recorder 内部已 fail+finish
+                status = "passed"
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                status = "failed"
+            duration = round(time.time() - t0, 1)
+
+            # 回放视频(测试报告):recording.json 已落盘才渲染
+            if rec is not None and os.path.isfile(rec.recording_path):
+                try:
+                    from replay_render import render_to_video
+                    out = render_to_video(rec.recording_path)
+                    replay_rel = os.path.relpath(out, plan_dir)
+                    self._bridge.post(lambda n=name, o=replay_rel: self._exec_log(
+                        f"[{n}] 回放视频: {o}"))
+                except Exception as exc:
+                    self._bridge.post(lambda n=name, m=str(
+                        exc): self._exec_log(f"[{n}] 回放渲染失败: {m}"))
+
+            mark = "✓ 成功" if status == "passed" else "✗ 失败"
+            self._bridge.post(lambda i=iid, m=mark: self._exec_set_status(i, m))
+            if error:
+                self._bridge.post(lambda n=name, m=error: self._exec_log(
+                    f"[{n}] 失败原因: {m}"))
+            self._bridge.post(lambda n=name, s=status, d=duration: self._exec_log(
+                f"[{n}] 结束: {s},耗时 {d}s"))
+            results.append({
+                "name": name,
+                "path": case["rel"],
+                "status": status,
+                "error": error,
+                "duration_sec": duration,
+                "recording": rec_rel,
+                "replay": replay_rel,
+            })
+
+        # 汇总测试计划 plan.json
+        passed = sum(1 for r in results if r["status"] == "passed")
+        summary = {
+            "version": 1,
+            "plan_id": plan_id,
+            "created_at": time.time(),
+            "created_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "device_id": runner.device_id,
+            "cases": results,
+            "summary": {
+                "total": len(results),
+                "passed": passed,
+                "failed": len(results) - passed,
+            },
+        }
+        plan_path = os.path.join(plan_dir, "plan.json")
+        try:
+            with open(plan_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self._bridge.post(lambda m=str(
+                exc): self._exec_log(f"[失败] plan.json 写入失败: {m}"))
+        self._bridge.post(
+            lambda p=passed, t=len(results), d=plan_dir: self._exec_log(
+                f"[计划完成] 通过 {p}/{t},结果目录: {d}"))
+        self._bridge.post(lambda: self._exec_finished())
+
+    def _make_exec_event(self, case_name: str, total: int):
+        """生成某条用例的步骤事件回调:日志带用例名前缀,写执行模式日志区。"""
+        def emit(idx: int, _total: int, msg: str) -> None:
+            self._bridge.post(
+                lambda n=case_name, i=idx, m=msg: self._exec_log(f"[{n}][{i}/{total}] {m}"))
+        return emit
+
+    def _exec_finished(self) -> None:
+        self._exec_busy = False
+        self._running = False
+        self._exec_btn.configure(state="normal")
+        if self._last_plan_dir:  # 执行完成后允许打开报告目录
+            self._exec_open_btn.configure(state="normal")
+
     def _on_step_event(self, idx: int, total: int, msg: str) -> None:
         # StepRunner 在后台线程,日志经 bridge 切回主线程刷新
         self._bridge.post(lambda: self._log(f"[{idx}/{total}] {msg}"))
@@ -1461,10 +2776,9 @@ class StepApp(tk.Tk):
 
     def _preview_running_step(self, index: int) -> None:
         """执行过程中高亮当前步并展示其预期画面(不改编辑用的等待输入框)。"""
-        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_remove(self.listbox.selection())
         if 0 <= index < len(self.steps):
-            self.listbox.selection_set(index)
-            self.listbox.see(index)
+            self._list_select(index)
             self._show_expect_preview(index)
 
     def _log(self, msg: str) -> None:
@@ -1472,6 +2786,12 @@ class StepApp(tk.Tk):
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        # 同步到普通模式 Tab 内的日志区
+        if hasattr(self, "_normal_log_text"):
+            self._normal_log_text.configure(state="normal")
+            self._normal_log_text.insert("end", msg + "\n")
+            self._normal_log_text.see("end")
+            self._normal_log_text.configure(state="disabled")
 
     # ------------------------------------------------------------------
     # AI 模式
@@ -1488,21 +2808,66 @@ class StepApp(tk.Tk):
         self._ai_log_text.configure(state="disabled")
 
     def _ai_chat_append(self, speaker: str, text: str) -> None:
-        """向 AI 对话区追加一条消息。"""
-        self._ai_chat.configure(state="normal")
-        tag = "ai" if speaker == "AI" else "user"
-        self._ai_chat.insert("end", f"[{speaker}] ", tag)
-        self._ai_chat.insert("end", text + "\n\n")
-        self._ai_chat.see("end")
-        self._ai_chat.configure(state="disabled")
+        """向 AI 对话区追加一条消息(气泡式:AI 左灰底 / 用户右紫底)。"""
+        if speaker == "AI":
+            self._ai_chat.add_ai(text)
+        elif speaker == "系统":
+            self._ai_chat.add_sys(text)
+        else:
+            self._ai_chat.add_user(text)
+
+    def _show_cand_card(self, visible: bool) -> None:
+        """候选确认卡片整体显隐(信息 + 三个按钮同进同退)。
+
+        AI Tab 内部用 pack,卡片必须插在对话区之后、输入行之前,
+        故用 before=self._ai_input_row 固定顺序。
+        """
+        if visible:
+            self._ai_cand_frame.pack(side="top", fill="x", pady=(0, 4),
+                                     before=self._ai_input_row)
+        else:
+            self._ai_cand_frame.pack_forget()
+
+    def _set_cand_btns(self, confirm: bool, deny: bool, next_btn: bool) -> None:
+        """候选卡片内按钮显隐(卡片已显示时调用)。"""
+        for btn, flag in ((self._ai_confirm_btn, confirm),
+                          (self._ai_deny_btn, deny),
+                          (self._ai_next_btn, next_btn)):
+            if flag:
+                btn.pack(side="left", padx=4, pady=2)
+            else:
+                btn.pack_forget()
+
+    def _switch_tab(self, idx: int) -> None:
+        """切换右栏 Tab:高亮选中按钮 + 显示对应面板。"""
+        if not 0 <= idx < len(self._tab_panels):
+            return
+        self._tab_idx = idx
+        for i, (tf, lbl, uline) in enumerate(self._tab_buttons):
+            if i == idx:
+                tf.configure(bg=THEME["surface"])
+                lbl.configure(bg=THEME["surface"], fg=THEME["txt"])
+                uline.configure(bg=THEME["accent"])
+            else:
+                tf.configure(bg=THEME["bg2"])
+                lbl.configure(bg=THEME["bg2"], fg=THEME["txt2"])
+                uline.configure(bg=THEME["bg2"])
+        for i, panel in enumerate(self._tab_panels):
+            if i == idx:
+                panel.grid()
+            else:
+                panel.grid_remove()
+        self._on_tab_changed()
 
     def _on_tab_changed(self, event=None) -> None:
-        """切普通模式恢复纯网格;切回 AI 模式重绘当前候选。"""
-        if self.notebook.index("current") == 0:
+        """Tab 切换:普通模式清除 AI 候选叠加;AI 模式重绘当前候选。"""
+        idx = self._tab_idx
+        if idx == 0:  # AI 模式
+            if (self._ai_result is not None
+                    and self._ai_result.top_candidates and not self._ai_busy):
+                self._show_candidate(self._ai_cand_idx, silent=True)
+        elif idx == 1:  # 普通模式
             self._clear_ai_overlay()
-        elif (self._ai_result is not None and self._ai_result.top_candidates
-              and not self._ai_busy):
-            self._show_candidate(self._ai_cand_idx, silent=True)
 
     _AI_MODE_MAP = {"全流程": "full", "仅OCR": "ocr_only", "仅VLM": "vlm_only"}
 
@@ -1515,9 +2880,7 @@ class StepApp(tk.Tk):
         self._ai_instruction = instruction  # 确认后随步骤保存为 desc
 
         # 清除上一次的候选预览
-        self._ai_confirm_btn.grid_remove()
-        self._ai_deny_btn.grid_remove()
-        self._ai_next_btn.grid_remove()
+        self._show_cand_card(False)
         self._ai_cand_info_var.set("")
         self._clear_ai_overlay()
         self._ai_result = None
@@ -1620,12 +2983,8 @@ class StepApp(tk.Tk):
                                        "或「⟳ 刷新截图」丢弃)")
             self._ai_log(f"候选{idx + 1}/{n} {cell} ({x},{y}) {sources} "
                          f"conf={cand.confidence:.2f} {ver}")
-        self._ai_confirm_btn.grid()
-        self._ai_deny_btn.grid()
-        if n > 1:
-            self._ai_next_btn.grid()
-        else:
-            self._ai_next_btn.grid_remove()
+        self._show_cand_card(True)
+        self._set_cand_btns(True, True, n > 1)
 
     def _ai_cycle_candidate(self, delta: int) -> None:
         """切换到下一个/上一个候选。"""
@@ -1676,7 +3035,7 @@ class StepApp(tk.Tk):
         self.steps.append(step)
         self._refresh_list()
         self._select_and_preview(len(self.steps) - 1)
-        self.listbox.see("end")
+        self._list_see_end()
 
         if step["type"] == "input":
             warn = ""
@@ -1703,9 +3062,7 @@ class StepApp(tk.Tk):
         self._ai_drag_last = None
         self._ai_cand_idx = 0
         self._ai_cand_info_var.set("")
-        self._ai_confirm_btn.grid_remove()
-        self._ai_deny_btn.grid_remove()
-        self._ai_next_btn.grid_remove()
+        self._show_cand_card(False)
 
     def _clear_ai_overlay(self) -> None:
         """画布恢复纯网格图。"""

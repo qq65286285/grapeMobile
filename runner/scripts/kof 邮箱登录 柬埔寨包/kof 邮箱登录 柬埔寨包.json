@@ -1,0 +1,70 @@
+[
+  {
+    "type": "tap",
+    "cell": "W10",
+    "x": 684,
+    "y": 271,
+    "delay_before": 0.0,
+    "wait_after": 30.0,
+    "before_image": "images/before_0009.png",
+    "after_image": "",
+    "desc": "点击kof legend"
+  },
+  {
+    "type": "tap",
+    "cell": "P32",
+    "x": 450,
+    "y": 952,
+    "delay_before": 0.0,
+    "wait_after": 10.0,
+    "before_image": "images/before_0010.png",
+    "after_image": "",
+    "desc": "点击中间弹框下面的them tai khoan ，中文意思为 登录新账户"
+  },
+  {
+    "type": "tap",
+    "cell": "J30",
+    "x": 290,
+    "y": 876,
+    "delay_before": 0.0,
+    "wait_after": 10.0,
+    "before_image": "images/before_0011.png",
+    "after_image": "",
+    "desc": "点击email"
+  },
+  {
+    "type": "input",
+    "cell": "I27",
+    "x": 258,
+    "y": 781,
+    "delay_before": 0.0,
+    "wait_after": 10.0,
+    "before_image": "images/before_0012.png",
+    "after_image": "",
+    "desc": "找到nhap dia chi email这个文本框，在里面输入65286285@qq.com",
+    "text": "65286285@qq.com"
+  },
+  {
+    "type": "input",
+    "cell": "L30",
+    "x": 346,
+    "y": 891,
+    "delay_before": 0.0,
+    "wait_after": 10.0,
+    "before_image": "images/before_0014.png",
+    "after_image": "",
+    "desc": "[用户] 找到在文本框 ma xac minh ，在里面输入000000",
+    "text": "000000"
+  },
+  {
+    "type": "tap",
+    "cell": "O34",
+    "x": 449,
+    "y": 1018,
+    "delay_before": 0.0,
+    "wait_after": 10.0,
+    "before_image": "images/before_0015.png",
+    "after_image": "",
+    "desc": "点击按钮：dang nhap ，中文意思为登录"
+  }
+]
