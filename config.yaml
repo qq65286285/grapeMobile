@@ -1,0 +1,48 @@
+# GrapeMobile 配置文件
+# 用法: load_config() 默认读取此文件;环境变量优先级高于此文件
+
+# ---- AI 客户端(OpenAI 兼容接口) ----
+ai:
+  base_url: "https://apihub.agnes-ai.com/v1"
+  api_key: "sk-JVlPWd1Mjt8sjzNKciiQrsDIEFSO1rxvWEuMzYv9rNNuYEAu"
+  model: "agnes-3.0-flash"
+  timeout: 120
+  max_tokens: 2048
+
+# ---- 定位管线 ----
+locate:
+  mode: full                # full | ocr_only | vlm_only
+  vlm:
+    provider: openai_compat
+    base_url: "https://apihub.agnes-ai.com/v1"
+    api_key: "sk-JVlPWd1Mjt8sjzNKciiQrsDIEFSO1rxvWEuMzYv9rNNuYEAu"
+    model: "agnes-3.0-flash"
+    fallback_model: ""
+    samples: 3
+    temperature: 0.4
+    coord_format: norm1000_xyxy
+    max_side: 1568
+    timeout: 120
+  ocr:
+    engine: rapidocr
+    fuzzy_threshold: 0.8
+    icon_search_ratio: 3.5
+  verify:
+    enabled: true
+    crop_expand: 0.2
+    min_size: 256
+    top_k: 3
+  fusion:
+    weights:
+      template: 0.5
+      ocr_exact: 0.35
+      ocr_fuzzy: 0.2
+      vlm_consistent: 0.3
+      multi_source: 0.15
+  debug:
+    save_images: true
+    dir: runner/tmp/locate_debug
+
+# ---- 网格 ----
+grid:
+  cell_size: 30

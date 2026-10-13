@@ -1,7 +1,0 @@
-cases:
-  - name: nested case
-    steps:
-      - test.record:
-          value: nested:one
-      - test.record:
-          value: nested:two

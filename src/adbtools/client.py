@@ -43,6 +43,24 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 DEFAULT_SCREENSHOT_PATH = os.path.join(_PROJECT_ROOT, "runner", "tmp", "image", "screenshot.png")
 
 
+def read_device_id(device_id_file: str) -> str:
+    """
+    读取设备 id 记录文件(runner/device_id.txt,由 runner/capture.py 截图时写入)。
+
+    各命令行入口(main.py / grid.py)共用本函数,避免各自实现一份。
+
+    Args:
+        device_id_file: 设备 id 文件路径。
+
+    Returns:
+        设备 id 字符串;文件不存在或内容为空时返回空串。
+    """
+    if os.path.isfile(device_id_file):
+        with open(device_id_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
 class AdbError(Exception):
     """
     adb 命令执行失败时抛出。
@@ -385,6 +403,26 @@ class AdbClient:
         if m:
             return m.group(1)
         raise AdbError("无法识别当前前台 App 包名(dumpsys 输出中无焦点窗口信息)")
+
+    def command_str(self, *args: str) -> str:
+        """
+        生成与 _run 等价的 adb 命令字符串,仅用于向用户展示,不执行。
+
+        各入口里 "adb -s <id> shell input tap x y" 之类的命令字符串统一由本方法
+        生成,避免多处各拼各的、展示命令与真实执行命令不一致。
+
+        Args:
+            *args: adb 子命令参数,如 ("shell", "input", "tap", "100", "200")。
+
+        Returns:
+            完整命令字符串,如 "adb -s emulator-5554 shell input tap 100 200";
+            尚未连接设备时省略 -s 段。
+        """
+        cmd: List[str] = [self.adb_path]
+        if self.device_id:
+            cmd += ["-s", self.device_id]
+        cmd += list(args)
+        return " ".join(cmd)
 
     # ------------------------------------------------------------------
     # 内部工具

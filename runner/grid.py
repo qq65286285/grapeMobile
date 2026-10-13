@@ -16,9 +16,11 @@ runner/grid.py - 网格坐标标注入口
 
 格子尺寸档位（以 720x1280 截图为例）:
     80  粗网格  约 9 列 x 16 行，标签最醒目，目标区域较大时用
-    60  中网格  约 12 列 x 22 行（默认，精度与可读性平衡）
+    60  中网格  约 12 列 x 22 行
     40  细网格  约 18 列 x 32 行，格子中心最大偏差约 20px
-    也支持任意自定义像素值（>=20）。
+    30  超细    约 24 列 x 43 行
+    也支持任意自定义像素值（>=20）。无参运行时的默认值取 config.yaml 的
+    grid.cell_size（与 GUI / AI 定位保持单一来源，当前默认 30）。
 """
 
 from __future__ import annotations
@@ -34,13 +36,15 @@ _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 sys.path.insert(0, _SRC_DIR)
 
 from grid import GridMarker, col_name, parse_ref  # noqa: E402
-from adbtools import AdbClient, AdbError  # noqa: E402
+from adbtools import AdbClient, AdbError, read_device_id  # noqa: E402
+from locate.config import load_config  # noqa: E402
 
 # ============================================================
 # 默认配置：无参直接执行时使用的格子边长(像素)
-#   60=中  30=细(默认)  20=超细
+#   单一来源为 config.yaml 的 grid.cell_size(默认 30)，
+#   与 GUI、AI 定位管线保持一致(CR-02)
 # ============================================================
-CELL_SIZE = 30
+CELL_SIZE = load_config().grid.cell_size
 
 # 固定文件位置
 _IMAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp", "image")
@@ -50,34 +54,30 @@ GRID_META = os.path.join(_IMAGE_DIR, "grid_meta.json")
 DEVICE_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_id.txt")
 
 
-def _read_device_id() -> str:
-    """读取 capture.py 截图时记录的 device_id;无记录时返回空字符串。"""
-    if os.path.isfile(DEVICE_ID_FILE):
-        with open(DEVICE_ID_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return ""
-
-
-def _adb_prefix() -> str:
-    """返回带 -s 的 adb 命令前缀(无设备记录时退回 "adb")。"""
-    device_id = _read_device_id()
-    return f"adb -s {device_id}" if device_id else "adb"
-
-
 def _execute_tap(x: int, y: int) -> bool:
-    """在截图所用设备上执行点击。无设备记录时跳过,返回 False。"""
-    device_id = _read_device_id()
-    if not device_id:
+    """在截图所用设备上执行点击。无设备记录时只输出命令,返回 False。"""
+    device_id = read_device_id(DEVICE_ID_FILE)
+    client = AdbClient()
+    if device_id:
+        try:
+            client.attach(device_id)  # 校验在线并记录 device_id
+        except AdbError as exc:
+            print(f"[ERROR] 设备连接失败: {exc}")
+            return False
+    else:
         print("[WARN] 未找到 device_id 记录(截图非经 capture.py 获得),仅输出命令未执行点击")
+
+    # 展示的命令串与真实执行保持同一来源(AdbClient.command_str)
+    print(f"adb 点击命令:   {client.command_str('shell', 'input', 'tap', str(x), str(y))}")
+    if not device_id:
         return False
+
     try:
-        client = AdbClient()
-        client.attach(device_id)  # 校验在线并记录 device_id
         client.tap(x, y)
     except AdbError as exc:
         print(f"[ERROR] 点击执行失败: {exc}")
         return False
-    print(f"已执行点击: adb -s {device_id} shell input tap {x} {y}")
+    print(f"已执行点击: ({x}, {y})")
     return True
 
 
@@ -120,14 +120,14 @@ def _generate(cell_size: int) -> int:
 
 
 def _query(ref: str, cell_size_override: int | None = None) -> int:
-    """将格子编号换算为原图中心像素坐标并输出 adb 点击命令。"""
+    """将格子编号换算为原图中心像素坐标并执行点击。"""
     img = cv2.imread(SOURCE_IMAGE)
     if img is None:
         print(f"[ERROR] 未找到可读原图: {SOURCE_IMAGE}")
         print("        请先运行: python runner/capture.py <device_id> 截图")
         return 1
 
-    # 格子尺寸：显式参数 > sidecar 元数据 > 文件默认值
+    # 格子尺寸：显式参数 > sidecar 元数据 > config.yaml 默认值
     cell_size = cell_size_override
     if cell_size is None and os.path.isfile(GRID_META):
         try:
@@ -155,10 +155,9 @@ def _query(ref: str, cell_size_override: int | None = None) -> int:
     print(f"格子 {ref.upper()} (列 {col_name(col)}, 行 {row + 1:g})")
     print(f"格子边长: {cell_size}px | 原图: {img.shape[1]}x{img.shape[0]}")
     print(f"像素坐标: ({x}, {y})")
-    print(f"adb 点击命令:   {_adb_prefix()} shell input tap {x} {y}")
     print("=" * 56)
     tapped = _execute_tap(x, y)
-    return 0 if tapped or not _read_device_id() else 1
+    return 0 if tapped or not read_device_id(DEVICE_ID_FILE) else 1
 
 
 def main() -> int:

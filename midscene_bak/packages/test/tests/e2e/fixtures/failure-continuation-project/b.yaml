@@ -1,5 +1,0 @@
-cases:
-  - name: later document
-    steps:
-      - test.record:
-          value: third:passed

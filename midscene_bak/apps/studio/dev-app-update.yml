@@ -1,4 +1,0 @@
-provider: github
-owner: web-infra-dev
-repo: midscene
-updaterCacheDirName: midscene-studio-beta-updater

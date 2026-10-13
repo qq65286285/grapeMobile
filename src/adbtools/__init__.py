@@ -18,6 +18,6 @@ src/adbtools - ADB 设备工具包
     # 4. python runner/main.py -> 输出坐标 + adb tap 命令
 """
 
-from adbtools.client import AdbClient, AdbError
+from adbtools.client import AdbClient, AdbError, read_device_id
 
-__all__ = ["AdbClient", "AdbError"]
+__all__ = ["AdbClient", "AdbError", "read_device_id"]

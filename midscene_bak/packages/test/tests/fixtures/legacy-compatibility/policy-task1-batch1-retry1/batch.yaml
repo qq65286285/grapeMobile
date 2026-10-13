@@ -1,4 +1,0 @@
-files: [a.yaml, b.yaml]
-continueOnError: true
-retry: 1
-concurrent: 1

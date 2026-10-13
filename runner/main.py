@@ -4,15 +4,14 @@ runner/main.py - AI 定位运行入口
 职责:
     1. 连接设备,实时截图
     2. 生成网格标注图(列 A/B/C..., 行 1/2/3...)
-    3. 调用 AI(agnes-3.0-flash vision) 分析网格图,识别所有可点击元素
-    4. 输出元素列表,标注各自所在格子编号 + 原图像素坐标 + adb 命令
+    3. 调用 AI(vision 模型)分析网格图,识别所有可点击元素
+    4. 输出元素列表,标注各自所在格子编号 + 原图像素坐标 + adb 点击命令
 
 运行方式:
     cd e:/GrapeMobile
     python runner/main.py
 
 前提: runner/device_id.txt 存在(python runner/capture.py 已跑过一次)。
-旧版 imgloc 模板匹配方案备份于 runner/main_old.py。
 """
 
 from __future__ import annotations
@@ -28,8 +27,9 @@ sys.path.insert(0, _SRC_DIR)
 
 import cv2  # noqa: E402
 from aiclient import AIClient, AIError  # noqa: E402
-from adbtools import AdbClient, AdbError  # noqa: E402
+from adbtools import AdbClient, AdbError, read_device_id  # noqa: E402
 from grid import GridMarker, col_name  # noqa: E402
+from locate.config import load_config  # noqa: E402
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _IMAGE_DIR = os.path.join(_BASE_DIR, "tmp", "image")
@@ -37,7 +37,8 @@ SCREENSHOT_PATH = os.path.join(_IMAGE_DIR, "screenshot.png")
 GRID_IMAGE_PATH = os.path.join(_IMAGE_DIR, "grid_screenshot.png")
 GRID_META_PATH = os.path.join(_IMAGE_DIR, "grid_meta.json")
 DEVICE_ID_FILE = os.path.join(_BASE_DIR, "device_id.txt")
-CELL_SIZE = 30  # 网格格子边长(与 capture.py 一致)
+# 网格格子边长从 config.yaml 的 grid.cell_size 读取(单一来源)
+CELL_SIZE = load_config().grid.cell_size
 
 _SYSTEM_PROMPT = (
     "你是一个 Android 自动化助手。用户会给你一张带网格标注的设备截图。"
@@ -48,31 +49,11 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _read_device_id() -> str:
-    """从 device_id.txt 读取设备 ID。"""
-    if not os.path.isfile(DEVICE_ID_FILE):
-        return ""
-    with open(DEVICE_ID_FILE, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-def _adb_prefix(device_id: str) -> str:
-    """返回带 -s 的 adb 命令前缀。"""
-    return f"adb -s {device_id}" if device_id else "adb"
-
-
-def _capture_and_grid(device_id: str) -> tuple[str, str, int, int, GridMarker] | None:
+def _capture_and_grid(client: AdbClient) -> tuple[str, str, int, int, GridMarker] | None:
     """
-    连接设备截图 → 生成网格标注图。
+    用已连接的 client 截图 → 生成网格标注图。
     返回 (截图路径, 网格图路径, 原始宽, 原始高, GridMarker),失败返回 None。
     """
-    try:
-        client = AdbClient()
-        client.attach(device_id)
-    except AdbError as exc:
-        print(f"[FAIL] 设备连接失败: {exc}")
-        return None
-
     try:
         path = client.screenshot(save_path=SCREENSHOT_PATH)
     except AdbError as exc:
@@ -121,21 +102,28 @@ def main() -> int:
         1: 设备/截图问题;
         2: AI 调用或解析失败。
     """
-    device_id = _read_device_id()
+    device_id = read_device_id(DEVICE_ID_FILE)
     if not device_id:
         print("[ERROR] 无设备记录(device_id.txt),请先运行 python runner/capture.py")
         return 1
 
-    # ---- 1. 截图 + 生成网格 ----
+    # ---- 1. 连接设备 + 截图 + 生成网格 ----
     print(f"[设备] {device_id} 正在截图...")
-    result = _capture_and_grid(device_id)
+    client = AdbClient()
+    try:
+        client.attach(device_id)
+    except AdbError as exc:
+        print(f"[FAIL] 设备连接失败: {exc}")
+        return 1
+
+    result = _capture_and_grid(client)
     if result is None:
         return 1
     screenshot_path, grid_path, orig_w, orig_h, marker = result
     img_shape = (orig_h, orig_w, 3)
 
     # ---- 2. AI 分析网格图 ----
-    ai = AIClient()
+    ai = AIClient.from_config(load_config())
     prompt = (
         "这是一张带网格标注的设备截图。"
         "请识别截图中所有可点击的按钮/图标区域,"
@@ -160,7 +148,6 @@ def main() -> int:
         print(f"[AI 回复] {reply}")
         return 2
 
-    adb = _adb_prefix(device_id)
     print("=" * 60)
     print(f"AI 识别到 {len(items)} 个可点击元素 "
           f"(原始分辨率 {orig_w}x{orig_h}):")
@@ -177,7 +164,7 @@ def main() -> int:
             print(f"  {i:2d}. [{desc}]  格子 {cell} 无效: {exc}")
             continue
         print(f"  {i:2d}. [{desc}]  格子 {cell}  坐标 ({x}, {y})")
-        print(f"      {adb} shell input tap {x} {y}")
+        print(f"      {client.command_str('shell', 'input', 'tap', str(x), str(y))}")
     print("=" * 60)
     return 0
 

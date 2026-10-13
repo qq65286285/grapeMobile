@@ -9,7 +9,8 @@ src/aiclient.py - AI API 客户端(OpenAI 兼容)
 
 用法:
     >>> from aiclient import AIClient
-    >>> ai = AIClient()
+    >>> from locate.config import load_config
+    >>> ai = AIClient.from_config(load_config())   # 从 config.yaml 读取
     >>> ai.chat("你好")
     '你好！有什么可以帮你的？'
     >>> ai.chat_with_image("截图里有什么按钮?", "runner/tmp/image/screenshot.png")
@@ -20,14 +21,16 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Union
 
-# ---- 配置(可按需修改或通过构造参数覆盖) ----
+logger = logging.getLogger("imgloc.aiclient")
+
+# ---- 配置(仅作 fallback,实际值应从 config.yaml 读取) ----
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com/v1"
-DEFAULT_API_KEY = "sk-JVlPWd1Mjt8sjzNKciiQrsDIEFSO1rxvWEuMzYv9rNNuYEAu"
 DEFAULT_MODEL = "agnes-3.0-flash"
 DEFAULT_TIMEOUT = 120  # 秒(vision 请求图片大,需留足时间)
 DEFAULT_MAX_TOKENS = 2048
@@ -43,8 +46,8 @@ def _emit_trace(msg: str) -> None:
         return
     try:
         fn(msg)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("trace 回调异常: %s", exc)
 
 
 def _summarize_messages(messages: List[Dict[str, Any]], limit: int = 800) -> str:
@@ -74,16 +77,49 @@ class AIClient:
     def __init__(
         self,
         base_url: str = DEFAULT_BASE_URL,
-        api_key: str = DEFAULT_API_KEY,
+        api_key: Optional[str] = None,
         model: str = DEFAULT_MODEL,
         timeout: int = DEFAULT_TIMEOUT,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> None:
+        if not api_key:
+            raise AIError(
+                "未配置 API Key,请在 config.yaml 的 ai.api_key 中设置"
+            )
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "AIClient":
+        """从 LocateConfig 或 dict 创建 AIClient。
+
+        Args:
+            cfg: LocateConfig 对象(有 .ai 属性)或包含 ai 字段的 dict。
+        """
+        # 从 LocateConfig 创建
+        if hasattr(cfg, "ai"):
+            ai = cfg.ai
+            return cls(
+                base_url=ai.base_url,
+                api_key=ai.api_key or None,
+                model=ai.model,
+                timeout=ai.timeout,
+                max_tokens=ai.max_tokens,
+            )
+        # 从 dict 创建
+        if isinstance(cfg, dict):
+            ai = cfg.get("ai", {})
+            return cls(
+                base_url=ai.get("base_url", DEFAULT_BASE_URL),
+                api_key=ai.get("api_key") or None,
+                model=ai.get("model", DEFAULT_MODEL),
+                timeout=ai.get("timeout", DEFAULT_TIMEOUT),
+                max_tokens=ai.get("max_tokens", DEFAULT_MAX_TOKENS),
+            )
+        raise AIError(f"不支持的配置类型: {type(cfg)}")
 
     # ------------------------------------------------------------------
     # 核心调用
@@ -157,8 +193,8 @@ class AIClient:
                 if ok:
                     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
                     return f"data:image/jpeg;base64,{b64}"
-        except Exception:
-            pass  # cv2 不可用,回退到原始读取
+        except Exception as exc:
+            logger.warning("cv2 压缩图片失败,回退原始读取: %s", exc)
 
         # 回退:原始文件直接 base64
         with open(path, "rb") as f:

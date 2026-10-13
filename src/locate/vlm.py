@@ -147,20 +147,20 @@ class VlmLocator:
     def _ensure_client(self) -> AIClient:
         """
         惰性创建 AIClient。
-        config.api_key 为空时用 AIClient 默认配置(已有硬编码 key)。
+        从 config 读取 base_url/api_key/model/timeout,缺 key 时抛错。
         """
         if self._client is None:
             cfg = self.config
-            if cfg.api_key:
-                self._client = AIClient(
-                    base_url=cfg.base_url,
-                    api_key=cfg.api_key,
-                    model=cfg.model,
-                    timeout=cfg.timeout,
+            if not cfg.api_key:
+                raise AIError(
+                    "VLM 未配置 API Key,请在 config.yaml 的 locate.vlm.api_key 中设置"
                 )
-            else:
-                # api_key 为空,用 AIClient 默认配置(已有硬编码 key)
-                self._client = AIClient(model=cfg.model, timeout=cfg.timeout)
+            self._client = AIClient(
+                base_url=cfg.base_url,
+                api_key=cfg.api_key,
+                model=cfg.model,
+                timeout=cfg.timeout,
+            )
         return self._client
 
     # ------------------------------------------------------------------

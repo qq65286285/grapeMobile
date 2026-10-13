@@ -28,7 +28,7 @@ src/grid.py - 网格坐标标注器
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -120,7 +120,15 @@ class GridMarker:
         major_every: 每 N 格画一条更醒目的主网格线（类似坐标纸刻度），0 表示关闭。
     """
 
-    def __init__(self, cell_size: int = 60, margin: int = 40, major_every: int = 5):
+    def __init__(self, cell_size: Optional[int] = None, margin: int = 40, major_every: int = 5):
+        # cell_size 默认从 config.yaml 的 grid.cell_size 读取(单一来源);
+        # 读取失败回退 30,保持与 GUI/定位管线一致
+        if cell_size is None:
+            try:
+                from locate.config import load_config
+                cell_size = load_config().grid.cell_size
+            except Exception:
+                cell_size = 30
         if cell_size < 20:
             raise ValueError(f"cell_size 过小会导致标签无法辨认: {cell_size}（最小 20）")
         self.cell_size = int(cell_size)

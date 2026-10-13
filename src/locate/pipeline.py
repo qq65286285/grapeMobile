@@ -150,7 +150,8 @@ def locate(
             top_candidates=ranked,
         )
 
-    grid_cell = _point_to_cell(best.point, image_shape, cell_size=30)
+    grid_cell = _point_to_cell(best.point, image_shape,
+                               cell_size=config.grid.cell_size)
 
     # 调试图: 最终结果
     if config.debug.save_images:
@@ -182,13 +183,13 @@ def _parse_intent(query: str, config: LocateConfig) -> Intent:
     from .intent import parse_intent
 
     ai_client = None
-    # 仅在需要 LLM 时创建 client
+    # 仅在配置了 API Key 时创建 client(从 config.yaml 统一读取)
     if config.vlm.api_key:
         try:
             from aiclient import AIClient
-            ai_client = AIClient()
-        except Exception:
-            pass
+            ai_client = AIClient.from_config(config)
+        except Exception as exc:
+            logger.warning("AI 客户端创建失败,意图解析降级为规则模式: %s", exc)
 
     return parse_intent(query, ai_client=ai_client)
 

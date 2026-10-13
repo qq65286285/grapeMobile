@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
 
@@ -79,7 +80,13 @@ SCRIPTS_DIR = os.path.join(_BASE_DIR, "scripts")
 RESULT_DIR = os.path.join(_BASE_DIR, "result")
 # 新建脚本未保存前使用的临时脚本名(锚点先存到 scripts/untitled/images/,保存时迁移)
 DRAFT_SCRIPT_NAME = "untitled"
-DEFAULT_CELL_SIZE = 30  # 实时截图生成网格时的默认格子边长(像素)
+# 实时截图生成网格时的默认格子边长(像素):从 config.yaml 的 grid.cell_size 读取
+# (单一来源,与 AI 定位管线一致);读取失败回退 30
+try:
+    from locate.config import load_config as _load_cell_config
+    DEFAULT_CELL_SIZE = _load_cell_config().grid.cell_size
+except Exception:
+    DEFAULT_CELL_SIZE = 30
 MARGIN = 40  # 与 GridMarker 默认边距一致(网格图在原图四周外扩 40px)
 MAX_DISPLAY_WIDTH = 288   # 设备画面(左栏,宽320)网格图显示区域最大宽度(像素)
 MAX_DISPLAY_HEIGHT = 480  # 最大高度(像素),竖屏截图按三栏600高缩放适配
@@ -146,12 +153,16 @@ class _ChatPane:
                  height: int = 260) -> None:
         # 外层描边框:让对话区在深色底上明确成一个"面板"(对齐设计稿)
         self.frame = tk.Frame(parent, bg=THEME["border2"], bd=0)
-        # 用 pack 而非 grid_propagate(False):frame 尺寸由 canvas 请求,
-        # 气泡才能随内容增高(曾因 grid_propagate(False) 导致 frame 塌成 1x1)
+        # frame 内部用 grid:canvas 占 (0,0) sticky=nsew, 滚条占 (0,1) sticky=ns
+        # frame 不写 propagate,但 canvas 用 sticky="nsew" 撑满即可,
+        # 不钉死 height/width,这样父容器给多少高度就占多少
+        # frame 内部 grid 必须配 weight,否则 canvas sticky="nsew" 也撑不开
+        self.frame.rowconfigure(0, weight=1)
+        self.frame.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(self.frame, bg=THEME["surface"], highlightthickness=1,
                                 highlightbackground=THEME["border"],
                                 highlightcolor=THEME["border"],
-                                width=width, height=height, bd=0)
+                                bd=0)
         self.scroll = ttk.Scrollbar(self.frame, orient="vertical",
                                     command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scroll.set)
@@ -609,16 +620,22 @@ class DeviceSelectDialog(tk.Toplevel):
 class _RoundedBadge(tk.Label):
     """圆角数字徽章:用 PIL 绘制圆角矩形底图(非交互,纯展示)。"""
 
-    _img_cache: Dict[tuple, ImageTk.PhotoImage] = {}
+    # 类级 PIL 缓存:限制大小避免 Tcl 图片表无限增长导致 GC 越来越慢
+    _MAX_CACHE = 64
+    _img_cache: "OrderedDict[tuple, ImageTk.PhotoImage]" = OrderedDict()
 
     @classmethod
     def _make_bg(cls, w: int, h: int, r: int, fill: str) -> ImageTk.PhotoImage:
         key = (w, h, r, fill)
-        if key not in cls._img_cache:
-            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
-            cls._img_cache[key] = ImageTk.PhotoImage(img)
+        if key in cls._img_cache:
+            cls._img_cache.move_to_end(key)
+            return cls._img_cache[key]
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
+        cls._img_cache[key] = ImageTk.PhotoImage(img)
+        if len(cls._img_cache) > cls._MAX_CACHE:
+            cls._img_cache.popitem(last=False)
         return cls._img_cache[key]
 
     def __init__(self, parent, text: str, size: int = 22, radius: int = 5,
@@ -640,20 +657,26 @@ class _RoundedButton(tk.Label):
     对齐设计稿 .btn:font 13px、圆角 6px、内边距 7px 14px、1px border2 描边。
     """
 
-    _img_cache: Dict[tuple, ImageTk.PhotoImage] = {}
+    # 类级 PIL 缓存:限制大小避免 Tcl 图片表无限增长导致 GC 越来越慢
+    _MAX_CACHE = 96
+    _img_cache: "OrderedDict[tuple, ImageTk.PhotoImage]" = OrderedDict()
 
     @classmethod
     def _make_bg(cls, w: int, h: int, r: int, fill: str,
                  outline: Optional[str] = None) -> ImageTk.PhotoImage:
         key = (w, h, r, fill, outline)
-        if key not in cls._img_cache:
-            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            if outline:
-                d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill, outline=outline, width=1)
-            else:
-                d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
-            cls._img_cache[key] = ImageTk.PhotoImage(img)
+        if key in cls._img_cache:
+            cls._img_cache.move_to_end(key)
+            return cls._img_cache[key]
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        if outline:
+            d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill, outline=outline, width=1)
+        else:
+            d.rounded_rectangle([0, 0, w - 1, h - 1], r, fill=fill)
+        cls._img_cache[key] = ImageTk.PhotoImage(img)
+        if len(cls._img_cache) > cls._MAX_CACHE:
+            cls._img_cache.popitem(last=False)
         return cls._img_cache[key]
 
     def __init__(self, parent, text: str = "", command=None, style: str = "normal",
@@ -813,7 +836,7 @@ class StepApp(tk.Tk):
                                      "也可以切到普通模式直接点格子添加步骤。")
 
         # ---- 伪实时:每秒自动重截(后台线程生产,主线程应用) ----
-        self._auto_var = tk.BooleanVar(value=False)  # 自动刷新开关
+        self._auto_var = tk.BooleanVar(value=True)  # 自动刷新开关(默认开)
         self._auto_busy = False        # 是否有截图线程在跑(防止重叠)
         self._auto_fail_logged = False # 连续失败只记一次日志,避免刷屏
         self.after(1000, self._auto_tick)
@@ -836,14 +859,28 @@ class StepApp(tk.Tk):
     # 自动刷新(伪实时)
     # ------------------------------------------------------------------
     def _auto_tick(self) -> None:
-        """每秒触发一次:条件满足时启动后台截图线程。"""
+        """每秒触发一次:条件满足时启动后台截图线程。
+
+        暂停原因变化时写一条 Console 日志,让"画面为什么不动了"可诊断。
+        """
         if not self.winfo_exists():
             return
-        if (self._auto_var.get() and not self._running
-                and not self._auto_busy and self.device_id
-                # AI 定位中/候选待确认时暂停:候选坐标基于当前帧,
-                # 画面被自动刷新换掉后坐标即失效,确认按钮也会被 _set_grid 清掉
-                and not self._ai_busy and not self._ai_overlay_active):
+        reason = ""
+        if not self._auto_var.get():
+            reason = "开关已关闭"
+        elif self._running:
+            reason = "脚本运行中"
+        elif not self.device_id:
+            reason = "未连接设备"
+        elif self._ai_busy:
+            reason = "AI 定位中"
+        elif self._ai_overlay_active:
+            reason = "AI 候选待确认(点「✓ 保存为步骤」或「⟳ 刷新截图」恢复)"
+        if reason != getattr(self, "_auto_pause_reason", ""):
+            if reason:
+                self._log(f"[自动刷新] 暂停: {reason}")
+            self._auto_pause_reason = reason
+        if (not reason and not self._auto_busy):
             self._auto_busy = True
             threading.Thread(target=self._auto_worker, daemon=True).start()
         self.after(1000, self._auto_tick)
@@ -941,10 +978,15 @@ class StepApp(tk.Tk):
 
     def _set_grid(self, grid_bgr, cell_size: int) -> None:
         """设置当前网格图并重算显示参数(画布存在时同步刷新)。"""
+        prev = getattr(self, "grid_bgr", None)
         self.grid_bgr = grid_bgr
         self.cell_size = cell_size
         gh, gw = grid_bgr.shape[:2]
-        self.scale = min(1.0, MAX_DISPLAY_WIDTH / gw, MAX_DISPLAY_HEIGHT / gh)
+        # 网格尺寸未变时保留用户当前缩放:
+        # 否则自动刷新每秒调本方法,会把用户放大后的缩放打回适配值(缩放形同虚设)
+        if (prev is None or prev.shape != grid_bgr.shape
+                or not getattr(self, "scale", None)):
+            self.scale = min(1.0, MAX_DISPLAY_WIDTH / gw, MAX_DISPLAY_HEIGHT / gh)
         self.disp_w, self.disp_h = int(gw * self.scale), int(gh * self.scale)
         # Tkinter PhotoImage 不支持任意比例缩放,先用 cv2 缩放后写临时文件再加载
         disp = cv2.resize(grid_bgr, (self.disp_w, self.disp_h), interpolation=cv2.INTER_AREA)
@@ -955,7 +997,8 @@ class StepApp(tk.Tk):
         self.photo = new_photo
         self._photo_ref = old_photo  # 保持引用,避免旧图被 GC 导致画布闪黑
         if hasattr(self, "canvas"):
-            self.canvas.configure(width=self.disp_w, height=self.disp_h)
+            self.canvas.configure(width=self.disp_w, height=self.disp_h,
+                                  scrollregion=(0, 0, self.disp_w, self.disp_h))
             self.canvas.delete("all")
             self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
         self.title(f"GrapeMobile 步骤编排器 - {self.device_id or '静态网格图'}")
@@ -1068,7 +1111,6 @@ class StepApp(tk.Tk):
         root.columnconfigure(1, weight=1)   # 中栏:步骤实时预览(弹性)
         root.columnconfigure(2, weight=1)   # 右栏:三 Tab(弹性)
         root.rowconfigure(1, weight=1)      # 主体行
-        root.rowconfigure(2, weight=0)      # 底部 Console(固定高)
 
         # ==================================================================
         # 顶栏 appbar:品牌 + 设备状态 pill + 右侧图标按钮(对齐设计稿)
@@ -1111,24 +1153,43 @@ class StepApp(tk.Tk):
         # ==================================================================
         # 左栏:设备画面(画布 + 工具条 + 提示)
         # ==================================================================
-        left = tk.Frame(root, bg=THEME["bg"], width=280)
+        # 宽 320:容纳 288px 画布 + 17px 竖滚动条(288+17=305,280 会把滚动条裁掉)
+        left = tk.Frame(root, bg=THEME["bg"], width=320)
         left.grid(row=1, column=0, sticky="ns", padx=(10, 0), pady=8)
         left.grid_propagate(False)
         tk.Label(left, text="设备画面", fg=THEME["txt3"], bg=THEME["bg"],
                  font=FONT_CAPTION).pack(anchor="w", pady=(0, 6))
-        self.canvas = tk.Canvas(left, width=self.disp_w, height=self.disp_h,
+        # 画布 + 滚动条:放大(>适配比例)后可平移查看完整画面,
+        # 点击坐标统一走 canvasx/canvasy(视口坐标 -> 画布坐标)
+        cwrap = tk.Frame(left, bg=THEME["bg"])
+        cwrap.pack()
+        cwrap.grid_rowconfigure(0, weight=1)
+        cwrap.grid_columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(cwrap, width=self.disp_w, height=self.disp_h,
                                 highlightthickness=1,
                                 highlightbackground=THEME["border2"], bg=THEME["bg2"])
-        self.canvas.pack()
+        self.canvas.grid(row=0, column=0, sticky="nw")
+        cvs = ttk.Scrollbar(cwrap, orient="vertical", command=self.canvas.yview)
+        cvs.grid(row=0, column=1, sticky="ns")
+        chs = ttk.Scrollbar(cwrap, orient="horizontal", command=self.canvas.xview)
+        chs.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.canvas.configure(yscrollcommand=cvs.set, xscrollcommand=chs.set)
         self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        # 滚轮竖向平移(Windows: delta 为 120 的倍数)
+        self.canvas.bind("<MouseWheel>",
+                         lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
         # 工具条
         tools = tk.Frame(left, bg=THEME["bg"])
         tools.pack(fill="x", pady=(8, 0))
         self._grid_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(tools, text="网格", variable=self._grid_on,
                         command=self._toggle_grid).pack(side="left", padx=(0, 6))
+        # 伪实时开关:每秒后台重截设备画面(AI 定位/运行中会自动暂停)
+        self._auto_var = getattr(self, "_auto_var", tk.BooleanVar(value=True))
+        ttk.Checkbutton(tools, text="自动刷新", variable=self._auto_var).pack(
+            side="left", padx=(0, 6))
         _RoundedButton(tools, text="－", width=28,
                        command=lambda: self._zoom(1 / 1.25)).pack(side="left", padx=1)
         self._zoom_label = tk.Label(tools, text="100%", width=5, anchor="center",
@@ -1207,6 +1268,11 @@ class StepApp(tk.Tk):
         self.preview_frame.grid_columnconfigure(0, weight=1)
         self.preview_frame.grid_columnconfigure(1, weight=1)
         self._preview_index: Optional[int] = None
+        self._suppress_select = False  # 程序化选中时屏蔽 _on_select,避免重复加载图片
+        # LRU 有界缓存:防止单会话 Tcl 图片表 / 内存无限增长导致 GC 越来越慢
+        self._preview_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._img_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._CACHE_LIMIT = 96
         ttk.Label(self.preview_frame, text="步骤详情 / 锚点", style="Caption.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
         self._detail_info_var = tk.StringVar(value="未选中步骤")
@@ -1362,11 +1428,25 @@ class StepApp(tk.Tk):
         self._normal_log_text.pack(fill="x")
 
         # ---- AI 模式 Tab ----
-        ai_tab.rowconfigure(1, weight=1)
+        ai_tab.rowconfigure(1, weight=3)   # 思考过程区:主要弹性,跟随窗口拉高
+        ai_tab.rowconfigure(5, weight=1)   # 执行日志区:次要弹性
         ai_tab.columnconfigure(0, weight=1)
-        ttk.Label(ai_tab, text="智能定位", style="Caption.TLabel").grid(row=0, column=0, sticky="w")
-        self._ai_chat = _ChatPane(ai_tab, width=360, height=180)
-        self._ai_chat.frame.grid(row=1, column=0, sticky="nsew", pady=(2, 4))
+        ttk.Label(ai_tab, text="AI 思考过程", style="Caption.TLabel").grid(
+            row=0, column=0, sticky="w")
+        # 顶部思考过程区:aiclient 请求/回复 trace + 对话流(用户/AI/系统)并入同一流
+        thinkbox = ttk.Frame(ai_tab)
+        thinkbox.grid(row=1, column=0, sticky="nsew", pady=(2, 4))
+        thinkbox.columnconfigure(0, weight=1)
+        thinkbox.rowconfigure(0, weight=1)
+        self._ai_think_text = tk.Text(thinkbox, height=8, font=FONT_MONO,
+                                      state="disabled", bg=THEME["term_bg"],
+                                      fg=THEME["term_fg"], wrap="word",
+                                      relief="flat", bd=0)
+        self._ai_think_text.grid(row=0, column=0, sticky="nsew")
+        think_sb = ttk.Scrollbar(thinkbox, orient="vertical",
+                                 command=self._ai_think_text.yview)
+        think_sb.grid(row=0, column=1, sticky="ns")
+        self._ai_think_text.configure(yscrollcommand=think_sb.set)
         # 候选卡片
         self._ai_cand_frame = tk.Frame(ai_tab, bg=THEME["surface"])
         self._ai_cand_info_var = tk.StringVar(value="")
@@ -1384,9 +1464,13 @@ class StepApp(tk.Tk):
         self._ai_next_btn = _RoundedButton(cand_btns, text="换候选",
                                            command=lambda: self._ai_cycle_candidate(1))
         self._ai_next_btn.pack(side="left", padx=2)
+        # 候选卡片占位行:默认隐藏(_show_cand_card 控制 grid/grid_remove)。
+        # AI Tab 是 grid 布局,卡片不能用 pack 插入(同一容器混用会抛 TclError)
+        self._ai_cand_frame.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        self._ai_cand_frame.grid_remove()
         # 输入行
         self._ai_input_row = tk.Frame(ai_tab, bg=THEME["surface"])
-        self._ai_input_row.grid(row=2, column=0, sticky="ew", pady=(2, 2))
+        self._ai_input_row.grid(row=3, column=0, sticky="ew", pady=(2, 2))
         self._ai_input_row.columnconfigure(0, weight=1)
         self._ai_input_var = tk.StringVar()
         self._ai_entry = tk.Entry(self._ai_input_row, textvariable=self._ai_input_var,
@@ -1403,16 +1487,17 @@ class StepApp(tk.Tk):
                      state="readonly").grid(row=0, column=1, padx=(0, 4))
         _RoundedButton(self._ai_input_row, text="发送", command=self._ai_send,
                        style="primary").grid(row=0, column=2)
-        # AI 日志
-        ttk.Label(ai_tab, text="AI 日志 · 思考过程", style="Caption.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(6, 2))
+        # 执行日志(镜像主 Console 的 _log 输出)
+        ttk.Label(ai_tab, text="执行日志", style="Caption.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(6, 2))
         aibox = ttk.Frame(ai_tab)
-        aibox.grid(row=4, column=0, sticky="ew")
+        aibox.grid(row=5, column=0, sticky="nsew")
         aibox.columnconfigure(0, weight=1)
+        aibox.rowconfigure(0, weight=1)
         self._ai_log_text = tk.Text(aibox, height=6, font=FONT_MONO, state="disabled",
                                     bg=THEME["term_bg"], fg=THEME["term_fg"],
                                     wrap="word", relief="flat", bd=0)
-        self._ai_log_text.grid(row=0, column=0, sticky="ew")
+        self._ai_log_text.grid(row=0, column=0, sticky="nsew")
         ai_ls = ttk.Scrollbar(aibox, orient="vertical", command=self._ai_log_text.yview)
         ai_ls.grid(row=0, column=1, sticky="ns")
         self._ai_log_text.configure(yscrollcommand=ai_ls.set)
@@ -1477,24 +1562,6 @@ class StepApp(tk.Tk):
         self._last_plan_dir: Optional[str] = None
         self._exec_refresh()
 
-        # ==================================================================
-        # 底部 Console:常驻执行日志(全宽)
-        # ==================================================================
-        console = tk.Frame(root, bg=THEME["term_bg"], height=130,
-                           highlightthickness=1, highlightbackground=THEME["border"])
-        console.grid(row=2, column=0, columnspan=3, sticky="ew")
-        console.grid_propagate(False)
-        ch = tk.Frame(console, bg=THEME["term_bg"])
-        ch.pack(fill="x", padx=12, pady=(4, 2))
-        tk.Label(ch, text="●", fg=THEME["green"], bg=THEME["term_bg"],
-                 font=("Segoe UI", 8)).pack(side="left")
-        tk.Label(ch, text=" 执行日志 · Console", fg=THEME["txt2"],
-                 bg=THEME["term_bg"], font=FONT_CAPTION).pack(side="left")
-        self.log_text = tk.Text(console, height=6, font=FONT_MONO, state="disabled",
-                                bg=THEME["term_bg"], fg=THEME["term_fg"], wrap="word",
-                                relief="flat", bd=0)
-        self.log_text.pack(fill="both", expand=True, padx=12, pady=(0, 6))
-
         # 默认步骤等待时间(画布点击追加步骤时使用)
         self.before_var = tk.StringVar(value="0")
         self.after_var = tk.StringVar(value="10")
@@ -1514,16 +1581,27 @@ class StepApp(tk.Tk):
     def _zoom(self, factor: float) -> None:
         """缩放画布显示。self.scale 同时用于点击坐标换算,故缩放后点击依旧准确。"""
         base_h, base_w = self.grid_bgr.shape[:2]
-        new_scale = min(2.0, max(0.2, self.scale * factor))
-        self.scale = new_scale
-        self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
-        self._zoom_label.configure(text=f"{int(round(new_scale * 100))}%")
+        self.scale = min(2.0, max(0.2, self.scale * factor))
+        self.disp_w = max(1, int(base_w * self.scale))
+        self.disp_h = max(1, int(base_h * self.scale))
+        self._zoom_label.configure(text=f"{int(round(self.scale * 100))}%")
+        # AI 候选叠加态下缩放:重画叠加层(否则叠加图残留在旧缩放,点击却按新缩放换算)
+        if getattr(self, "_ai_overlay_active", False) and self._ai_result is not None:
+            self._show_candidate(self._ai_cand_idx, silent=True)
+        else:
+            self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
 
     def _zoom_reset(self) -> None:
-        """回到 1:1(按当前网格图原始像素 1:1 显示,超出部分由画布裁切)。"""
+        """回到 1:1(按当前网格图原始像素 1:1 显示,超出部分由滚动条平移查看)。"""
         self.scale = 1.0
-        self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
+        base_h, base_w = self.grid_bgr.shape[:2]
+        self.disp_w = max(1, int(base_w * self.scale))
+        self.disp_h = max(1, int(base_h * self.scale))
         self._zoom_label.configure(text="100%")
+        if getattr(self, "_ai_overlay_active", False) and self._ai_result is not None:
+            self._show_candidate(self._ai_cand_idx, silent=True)
+        else:
+            self._render_canvas(self.grid_bgr if self._grid_on.get() else self._latest_raw)
 
     def _render_canvas(self, bgr) -> None:
         """按当前 self.scale 把 bgr 渲染到画布(PhotoImage 不支持任意缩放,先落盘再加载)。
@@ -1541,7 +1619,8 @@ class StepApp(tk.Tk):
         cv2.imwrite(self._tmp, disp)
         new_photo = tk.PhotoImage(file=self._tmp)
         old_photo = getattr(self, "photo", None)
-        self.canvas.configure(width=self.disp_w, height=self.disp_h)
+        self.canvas.configure(width=self.disp_w, height=self.disp_h,
+                              scrollregion=(0, 0, self.disp_w, self.disp_h))
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=new_photo)
         self.photo = new_photo
@@ -1558,8 +1637,11 @@ class StepApp(tk.Tk):
         if self._ai_overlay_active:
             self._ai_adjust_candidate(self._event_to_raw(event), jump=True)
             return
-        orig_x = event.x / self.scale - MARGIN
-        orig_y = event.y / self.scale - MARGIN
+        # 视口坐标 -> 画布坐标(画布可滚动,事件坐标不含滚动偏移)
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        orig_x = cx / self.scale - MARGIN
+        orig_y = cy / self.scale - MARGIN
         meta_w = self.grid_bgr.shape[1] - 2 * MARGIN
         meta_h = self.grid_bgr.shape[0] - 2 * MARGIN
         if not (0 <= orig_x < meta_w and 0 <= orig_y < meta_h):
@@ -1567,8 +1649,12 @@ class StepApp(tk.Tk):
         col = int(orig_x // self.cell_size)
         row = int(orig_y // self.cell_size)
         cell = f"{col_name(col)}{row + 1}"
+        # 记录格子中心像素坐标,卡片显示用;回放时 steps 优先于格子换算
+        tap_x = int(col * self.cell_size + self.cell_size // 2)
+        tap_y = int(row * self.cell_size + self.cell_size // 2)
         step = {
             "type": "tap", "cell": cell,
+            "x": tap_x, "y": tap_y,
             "delay_before": self._spin_value(self.before_var),
             "wait_after": self._spin_value(self.after_var),
             "before_image": "",
@@ -1690,32 +1776,56 @@ class StepApp(tk.Tk):
         return os.path.join(SCRIPTS_DIR, DRAFT_SCRIPT_NAME)
 
     def _make_placeholder_image(self) -> "tk.PhotoImage":
-        """生成深灰占位图(保持预览区尺寸稳定,无标准图时显示)。"""
+        """生成深灰占位图(缓存,避免每次选中都写盘+创建 PhotoImage)。"""
+        if hasattr(self, "_placeholder_photo") and self._placeholder_photo is not None:
+            return self._placeholder_photo
         img = np.full((EXPECT_IMG_H, EXPECT_IMG_W, 3), 40, dtype=np.uint8)
         tmp = os.path.join(tempfile.gettempdir(), "grapemobile_expect_placeholder.png")
         cv2.imwrite(tmp, img)
-        return tk.PhotoImage(file=tmp)
+        self._placeholder_photo = tk.PhotoImage(file=tmp)
+        return self._placeholder_photo
 
-    def _set_preview_image(self, which: str, img: Optional[np.ndarray]) -> None:
-        """把图像等比缩放居中贴入固定预览框(which: "before"/"after")。"""
+    def _imread_cached(self, path: str):
+        """带 LRU 缓存的读图:同一张图只读盘+解码一次,后续命中内存缓存。"""
+        if path in self._img_cache:
+            self._img_cache.move_to_end(path)
+            return self._img_cache[path]
+        img = cvio.imread(path)
+        if img is not None:
+            self._img_cache[path] = img
+            if len(self._img_cache) > self._CACHE_LIMIT:
+                self._img_cache.popitem(last=False)
+        return img
+
+    def _set_preview_image(self, which: str, img: Optional[np.ndarray],
+                           cache_key: str = "") -> None:
+        """把图像等比缩放居中贴入固定预览框(which: "before"/after")。
+
+        用 PIL.ImageTk 从内存直接创建 PhotoImage,避免写盘+读盘的磁盘 I/O。
+        """
+        from PIL import Image, ImageTk
         photo_attr = f"_{which}_photo"
         label = self.before_img_label if which == "before" else self.after_img_label
         if img is None:
             photo = self._make_placeholder_image()
+        elif cache_key and cache_key in self._preview_cache:
+            self._preview_cache.move_to_end(cache_key)
+            photo = self._preview_cache[cache_key]
         else:
             h, w = img.shape[:2]
             scale = min(EXPECT_IMG_W / w, EXPECT_IMG_H / h)
             new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-            disp = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            canvas_img = np.full((EXPECT_IMG_H, EXPECT_IMG_W, 3), 34, dtype=np.uint8)
-            y0 = (EXPECT_IMG_H - new_h) // 2
-            x0 = (EXPECT_IMG_W - new_w) // 2
-            canvas_img[y0:y0 + new_h, x0:x0 + new_w] = disp
-            tmp = os.path.join(tempfile.gettempdir(),
-                               f"grapemobile_{which}_display.png")
-            cv2.imwrite(tmp, canvas_img)
-            # 必须保留 PhotoImage 引用,否则会被 Tk 垃圾回收导致不显示
-            photo = tk.PhotoImage(file=tmp)
+            # BGR -> RGB + 从内存直接创建,不写临时文件
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb).resize((new_w, new_h), Image.LANCZOS)
+            canvas = Image.new("RGB", (EXPECT_IMG_W, EXPECT_IMG_H), (40, 40, 40))
+            canvas.paste(pil, ((EXPECT_IMG_W - new_w) // 2,
+                               (EXPECT_IMG_H - new_h) // 2))
+            photo = ImageTk.PhotoImage(canvas)
+            if cache_key:
+                self._preview_cache[cache_key] = photo
+                if len(self._preview_cache) > self._CACHE_LIMIT:
+                    self._preview_cache.popitem(last=False)
         setattr(self, photo_attr, photo)
         label.configure(image=photo)
 
@@ -1866,9 +1976,10 @@ class StepApp(tk.Tk):
             self._set_preview_image("before", None)
             self.before_status_var.set(f"{title}\n无执行前标准图")
         else:
-            img = cvio.imread(os.path.join(self._current_script_dir(), before_rel)) \
-                if not os.path.isabs(before_rel) else cvio.imread(before_rel)
-            self._set_preview_image("before", img)
+            before_path = before_rel if os.path.isabs(before_rel) \
+                else os.path.join(self._current_script_dir(), before_rel)
+            img = self._imread_cached(before_path)
+            self._set_preview_image("before", img, cache_key=before_path)
             self.before_status_var.set(
                 f"{title}\n{before_rel}" if img is not None
                 else f"{title}\n执行前图缺失:\n{before_rel}")
@@ -1876,9 +1987,10 @@ class StepApp(tk.Tk):
         # 执行后
         after_rel = step.get("after_image", "")
         if after_rel:
-            img = cvio.imread(os.path.join(self._current_script_dir(), after_rel)) \
-                if not os.path.isabs(after_rel) else cvio.imread(after_rel)
-            self._set_preview_image("after", img)
+            after_path = after_rel if os.path.isabs(after_rel) \
+                else os.path.join(self._current_script_dir(), after_rel)
+            img = self._imread_cached(after_path)
+            self._set_preview_image("after", img, cache_key=after_path)
             self.after_status_var.set(
                 f"{title}\n{after_rel}" if img is not None
                 else f"{title}\n执行后图缺失:\n{after_rel}")
@@ -1916,10 +2028,22 @@ class StepApp(tk.Tk):
             self.listbox.see(kids[-1])
 
     def _on_select(self, _event: tk.Event) -> None:
-        """选中步骤时显示其预期画面。"""
+        """Treeview 选中步骤:显示预期画面 + 同步卡片高亮(用户手动点 Treeview 时触发)。
+
+        程序化选中(_select_and_preview/_preview_running_step)已自行处理预览,
+        此处若目标步未变则直接返回,避免同一张图被重复加载。
+        """
+        if self._suppress_select:
+            return
         sel = self._list_sel()
-        if len(sel) == 1:
-            self._show_expect_preview(sel[0])
+        if len(sel) != 1:
+            return
+        idx = sel[0]
+        if idx == self._preview_index:
+            return  # 目标步未变,无需重复加载/刷新
+        old_idx = self._preview_index
+        self._show_expect_preview(idx)
+        self._update_card_selection(old_idx, idx)
 
     def _apply_step_detail(self) -> None:
         """把右侧详情面板中的前/后等待写回当前选中步骤。"""
@@ -1934,8 +2058,9 @@ class StepApp(tk.Tk):
         da = self._spin_value(self._detail_after_var)
         self.steps[i]["delay_before"] = db
         self.steps[i]["wait_after"] = da
-        self._refresh_list()
-        self._select_and_preview(i)
+        # 等待时间只影响列表/卡片上的文案,不做全量重建:
+        # 1) 原地更新列表行 meta 列; 2) 卡片副标题无需等待,仅选中卡片高亮不变
+        self._update_list_row_waits(i)
         self._log(f"[修改] 第 {i + 1} 步等待: 前 {db:g}s / 后 {da:g}s")
 
     def _on_step_double_click(self, event: tk.Event) -> None:
@@ -2007,9 +2132,12 @@ class StepApp(tk.Tk):
                     step["package"] = pkg_var.get().strip()
             step["delay_before"] = self._spin_value(before_var)
             step["wait_after"] = self._spin_value(after_var)
-            self._refresh_list()
-            self._list_select(i)
-            self._show_expect_preview(i)
+            # 仅原地更新该行列表/卡片文案,不做全量重建;
+            # 走 _select_and_preview 统一保护路径(_suppress_select + 卡片高亮)
+            self._update_list_row_waits(i)
+            old_idx = self._preview_index
+            self._select_and_preview(i)
+            self._update_card_selection(old_idx, i)
             self._log(f"[修改] 第 {i + 1} 步 {self._step_action_text(step)}:"
                       f" 前 {step['delay_before']:g}s / 后 {step['wait_after']:g}s")
             dlg.destroy()
@@ -2021,19 +2149,90 @@ class StepApp(tk.Tk):
         dlg.grab_set()  # 模态
 
     def _select_and_preview(self, index: Optional[int]) -> None:
-        """程序化选中某步并刷新预期画面(selection_set 不触发 <<TreeviewSelect>>)。"""
+        """程序化选中某步并刷新预期画面(屏蔽 _on_select 避免重复加载图片)。"""
+        self._suppress_select = True
         self.listbox.selection_remove(self.listbox.selection())
         if index is not None and 0 <= index < len(self.steps):
             self._list_select(index)
             self._show_expect_preview(index)
         else:
             self._show_expect_preview(None)
+        self._suppress_select = False
 
     def _select_card(self, index: int) -> None:
-        """点击步骤卡片:选中并显示预览,同步高亮两处卡片。"""
+        """点击步骤卡片:选中并显示预览,同步高亮两处卡片。
+
+        不重建卡片列表(避免卡顿),仅更新新旧卡片边框高亮。
+        """
+        old_idx = self._preview_index
         self._select_and_preview(index)
-        self._refresh_step_cards()
-        self._refresh_normal_cards()
+        self._update_card_selection(old_idx, index)
+
+    def _update_list_row_waits(self, i: int) -> None:
+        """仅原地更新第 i 行 Treeview 的等待文案(不重建列表/卡片)。"""
+        db = self.steps[i].get("delay_before", 0)
+        da = self.steps[i].get("wait_after", 0)
+        try:
+            self.listbox.set(str(i), "waits", f"前{db:g}/后{da:g}")
+        except (tk.TclError, KeyError):
+            pass
+        # 卡片上的等待 chip 是 tk.Label,按文本定位原地刷新
+        self._refresh_card_wait_chips(i)
+
+    def _refresh_card_wait_chips(self, i: int) -> None:
+        """刷新指定索引卡片上的前/后等待 chip 文本。"""
+        db = self.steps[i].get("delay_before", 0)
+        da = self.steps[i].get("wait_after", 0)
+        for attr in ("_step_card_widgets", "_normal_card_widgets"):
+            cards = getattr(self, attr, None)
+            if not cards or not (0 <= i < len(cards)):
+                continue
+            card = cards[i]
+            if not card.winfo_exists():
+                continue
+            # 中栏卡片的 meta 帧在 row=2,直接遍历其子 Label
+            self._update_wait_labels(card, db, da)
+
+    @staticmethod
+    def _update_wait_labels(card: "tk.Frame", db: float, da: float) -> None:
+        """把卡片内文本为 '前Ns'/'后Ns' 的 Label 刷新为新值(限定 3 层深度)。"""
+        # 卡片布局:card(0) -> meta 帧(1) -> Label(2),只在第 2 层查找
+        try:
+            meta_frames = [c for c in card.winfo_children()
+                           if isinstance(c, tk.Frame)]
+        except tk.TclError:
+            return
+        for meta in meta_frames:
+            try:
+                children = meta.winfo_children()
+            except tk.TclError:
+                continue
+            for chip in children:
+                try:
+                    txt = chip.cget("text")
+                except tk.TclError:
+                    continue
+                if isinstance(txt, str):
+                    if txt.startswith("前") and txt.endswith("s"):
+                        chip.configure(text=f"前{db:g}s")
+                    elif txt.startswith("后") and txt.endswith("s"):
+                        chip.configure(text=f"后{da:g}s")
+
+    def _update_card_selection(self, old_idx: Optional[int],
+                                new_idx: Optional[int]) -> None:
+        """仅更新新旧卡片边框颜色(不改 thickness 避免触发 <Configure> 级联)。"""
+        for attr in ("_step_card_widgets", "_normal_card_widgets"):
+            cards = getattr(self, attr, None)
+            if not cards:
+                continue
+            for idx in (old_idx, new_idx):
+                if idx is None or not (0 <= idx < len(cards)):
+                    continue
+                card = cards[idx]
+                if not card.winfo_exists():
+                    continue
+                card.configure(highlightbackground=(
+                    THEME["accent"] if idx == new_idx else THEME["border"]))
 
     def _delete_step(self, index: int) -> None:
         """删除指定步骤(卡片右上角 ✕)。"""
@@ -2101,6 +2300,7 @@ class StepApp(tk.Tk):
         """重建中栏步骤卡片列表(Canvas 滚动区 + 每张卡片一个 Frame)。"""
         for child in self._step_cards_inner.winfo_children():
             child.destroy()
+        self._step_card_widgets: List[tk.Frame] = []
         if not self.steps:
             tk.Label(self._step_cards_inner, text="(暂无步骤,点击左侧画面添加)",
                      fg=THEME["txt3"], bg=THEME["surface"],
@@ -2110,10 +2310,9 @@ class StepApp(tk.Tk):
             card = tk.Frame(self._step_cards_inner, bg=THEME["bg2"],
                             highlightthickness=1, highlightbackground=THEME["border"])
             card.pack(fill="x", pady=(0, 6), padx=1)
-            # 选中态高亮
+            # 选中态高亮(仅改颜色,不改 thickness 避免布局抖动)
             if self._preview_index == i:
-                card.configure(highlightbackground=THEME["accent"],
-                               highlightthickness=2)
+                card.configure(highlightbackground=THEME["accent"])
             # 编号徽章(圆角)
             num = _RoundedBadge(card, text=str(i + 1), size=22, radius=5)
             num.grid(row=0, column=0, rowspan=2, padx=6, pady=6, sticky="n")
@@ -2146,7 +2345,10 @@ class StepApp(tk.Tk):
             else:
                 x, y = step.get("x"), step.get("y")
                 sub_text = f"格子 {step.get('cell', '')}" + (
-                    f" · ({x},{y})" if x is not None and y is not None else "")
+                    f" · ({x}, {y})" if x is not None and y is not None else "")
+                conf = step.get("confidence")
+                if conf is not None:
+                    sub_text += f" · 置信度 {conf}"
             tk.Label(sub, text=sub_text, fg=THEME["txt2"], bg=THEME["bg2"],
                      font=FONT_MONO, anchor="w").pack(side="left")
             # 等待 chip
@@ -2172,11 +2374,13 @@ class StepApp(tk.Tk):
             for w in (card, body, sub, meta, num):
                 w.bind("<Button-1>", lambda _e, idx=i: self._select_card(idx))
                 w.bind("<Double-Button-1>", lambda _e, idx=i: self._edit_step_waits(idx))
+            self._step_card_widgets.append(card)
 
     def _refresh_normal_cards(self) -> None:
         """重建右栏普通模式的紧凑步骤卡片(nstep:编号+标题+副标题+上移/下移/删除)。"""
         for child in self._normal_inner.winfo_children():
             child.destroy()
+        self._normal_card_widgets: List[tk.Frame] = []
         if not self.steps:
             tk.Label(self._normal_inner, text="(暂无步骤)",
                      fg=THEME["txt3"], bg=THEME["surface"],
@@ -2230,6 +2434,7 @@ class StepApp(tk.Tk):
             for w in (card, num, body):
                 w.bind("<Button-1>", lambda _e, idx=i: self._select_card(idx))
                 w.bind("<Double-Button-1>", lambda _e, idx=i: self._edit_step_waits(idx))
+            self._normal_card_widgets.append(card)
 
     def _refresh(self) -> None:
         """重新从设备截取当前画面并刷新网格显示(步骤列表保留)。"""
@@ -2400,6 +2605,9 @@ class StepApp(tk.Tk):
         self.script_name_var.set(self.script_name)  # 回填名称输入框
         script_dir = os.path.dirname(path)
         # 编号计数器在下次截图时按 images/ 实际内容扫描接续
+        # 切换脚本时清空图片缓存:旧脚本的锚点图路径与新脚本不同,避免误命中
+        self._img_cache.clear()
+        self._preview_cache.clear()
         self._refresh_list()
         self._select_and_preview(0 if self.steps else None)  # 加载后展示第一步标准图
         missing = [s[field] for s in self.steps for field in ("before_image", "after_image")
@@ -2776,16 +2984,12 @@ class StepApp(tk.Tk):
 
     def _preview_running_step(self, index: int) -> None:
         """执行过程中高亮当前步并展示其预期画面(不改编辑用的等待输入框)。"""
-        self.listbox.selection_remove(self.listbox.selection())
-        if 0 <= index < len(self.steps):
-            self._list_select(index)
-            self._show_expect_preview(index)
+        old_idx = self._preview_index
+        self._select_and_preview(index)
+        self._update_card_selection(old_idx, index)
 
     def _log(self, msg: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        self._mirror_exec_log(msg)
         # 同步到普通模式 Tab 内的日志区
         if hasattr(self, "_normal_log_text"):
             self._normal_log_text.configure(state="normal")
@@ -2797,36 +3001,57 @@ class StepApp(tk.Tk):
     # AI 模式
     # ------------------------------------------------------------------
     def _ai_trace(self, msg: str) -> None:
-        """aiclient trace 钩子:AI 请求/回复(思考过程)经 bridge 进 AI 日志区。"""
+        """aiclient trace 钩子:AI 请求/回复(思考过程)经 bridge 进顶部思考过程区。"""
         self._bridge.post(lambda: self._ai_log(msg))
 
     def _ai_log(self, msg: str) -> None:
-        """写入 AI 模式日志区。"""
+        """写入顶部"AI 思考过程"区。"""
+        if not hasattr(self, "_ai_think_text"):
+            return
+        self._ai_think_text.configure(state="normal")
+        self._ai_think_text.insert("end", msg + "\n")
+        self._ai_think_text.see("end")
+        self._ai_think_text.configure(state="disabled")
+
+    def _ai_chat_append(self, speaker: str, text: str) -> None:
+        """对话消息并入顶部思考过程区(带时间与发送者前缀)。"""
+        if not hasattr(self, "_ai_think_text"):
+            return
+        stamp = time.strftime("%H:%M:%S")
+        self._ai_think_text.configure(state="normal")
+        self._ai_think_text.insert("end", f"[{stamp}] [{speaker}] {text}\n")
+        self._ai_think_text.see("end")
+        self._ai_think_text.configure(state="disabled")
+
+    def _exec_log_apply(self, msg: str) -> None:
+        """主线程:执行日志写入底部"执行日志"区。"""
+        if not hasattr(self, "_ai_log_text"):
+            return
         self._ai_log_text.configure(state="normal")
         self._ai_log_text.insert("end", msg + "\n")
+        # 限制行数,防止长会话无限增长
+        lines = int(self._ai_log_text.index("end-1c").split(".")[0])
+        if lines > 500:
+            self._ai_log_text.delete("1.0", f"{lines - 300}.0")
         self._ai_log_text.see("end")
         self._ai_log_text.configure(state="disabled")
 
-    def _ai_chat_append(self, speaker: str, text: str) -> None:
-        """向 AI 对话区追加一条消息(气泡式:AI 左灰底 / 用户右紫底)。"""
-        if speaker == "AI":
-            self._ai_chat.add_ai(text)
-        elif speaker == "系统":
-            self._ai_chat.add_sys(text)
-        else:
-            self._ai_chat.add_user(text)
+    def _mirror_exec_log(self, msg: str) -> None:
+        """执行日志镜像到 AI Tab 底部(线程安全:经 bridge 切回主线程)。"""
+        if not hasattr(self, "_bridge"):
+            return
+        self._bridge.post(lambda: self._exec_log_apply(msg))
 
     def _show_cand_card(self, visible: bool) -> None:
         """候选确认卡片整体显隐(信息 + 三个按钮同进同退)。
 
-        AI Tab 内部用 pack,卡片必须插在对话区之后、输入行之前,
-        故用 before=self._ai_input_row 固定顺序。
+        AI Tab 是 grid 布局,卡片固定占用 row=2(对话区与输入行之间),
+        用 grid()/grid_remove() 显隐,不与 pack 混用。
         """
         if visible:
-            self._ai_cand_frame.pack(side="top", fill="x", pady=(0, 4),
-                                     before=self._ai_input_row)
+            self._ai_cand_frame.grid()
         else:
-            self._ai_cand_frame.pack_forget()
+            self._ai_cand_frame.grid_remove()
 
     def _set_cand_btns(self, confirm: bool, deny: bool, next_btn: bool) -> None:
         """候选卡片内按钮显隐(卡片已显示时调用)。"""
@@ -2874,7 +3099,12 @@ class StepApp(tk.Tk):
     def _ai_send(self) -> None:
         """用户发送指令 -> 新定位管线(OCR+VLM+模板 融合验证)。"""
         instruction = self._ai_input_var.get().strip()
-        if not instruction or self._ai_busy:
+        if not instruction:
+            return
+        if self._ai_busy:
+            # 忙时不能静默丢弃:用户会以为"发了没反应"
+            self._ai_chat_append(
+                "AI", "⏳ 上一条指令还在定位中(约 10~30 秒),请等它返回再发下一条。")
             return
         self._ai_input_var.set("")
         self._ai_instruction = instruction  # 确认后随步骤保存为 desc
@@ -2932,8 +3162,17 @@ class StepApp(tk.Tk):
         self._ai_chat_append("AI", f"定位失败: {msg}")
 
     def _ai_locate_done(self, result) -> None:
-        """管线返回 -> 展示第 1 个候选。"""
-        self._ai_busy = False
+        """管线返回 -> 展示第 1 个候选。任何异常都回显到对话区,绝不静默。"""
+        try:
+            self._show_locate_result(result)
+        except Exception as exc:
+            # 展示环节抛异常会让用户停在"正在定位..."后再无下文(看起来像无反应)
+            self._ai_busy = False
+            self._ai_chat_append("AI", f"结果处理异常: {exc}")
+            self._ai_log(f"locate_done 异常: {exc}")
+
+    def _show_locate_result(self, result) -> None:
+        """候选展示主体(由 _ai_locate_done 调用,异常由其兜底)。"""
         self._ai_result = result
         self._ai_cand_idx = 0
 
@@ -3026,6 +3265,8 @@ class StepApp(tk.Tk):
             "before_image": "",
             "after_image": "",
             "desc": (self._ai_instruction or "").strip(),  # 用户指令文本,便于阅读脚本
+            "confidence": round(cand.confidence, 2),  # AI 候选置信度,卡片显示用
+            "sources": "+".join(sorted(set(cand.sources or [cand.source]))),
         }
         if step["type"] == "input":
             step["text"] = input_text
@@ -3111,7 +3352,8 @@ class StepApp(tk.Tk):
                                  "grapemobile_ai_preview.png")
         cv2.imwrite(self._tmp, disp)
         self.photo = tk.PhotoImage(file=self._tmp)
-        self.canvas.configure(width=self.disp_w, height=self.disp_h)
+        self.canvas.configure(width=self.disp_w, height=self.disp_h,
+                              scrollregion=(0, 0, self.disp_w, self.disp_h))
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
         self._ai_overlay_active = True
@@ -3123,11 +3365,11 @@ class StepApp(tk.Tk):
         self._ai_adjust_candidate(self._event_to_raw(event), jump=False)
 
     def _event_to_raw(self, event: tk.Event) -> tuple:
-        """画布事件坐标 -> 原始截图坐标(去缩放/边距),并夹取到画面内。"""
+        """画布事件坐标 -> 原始截图坐标(视口->画布->去缩放/边距),并夹取到画面内。"""
         raw_w = self.grid_bgr.shape[1] - 2 * MARGIN
         raw_h = self.grid_bgr.shape[0] - 2 * MARGIN
-        x = int(round(event.x / self.scale - MARGIN))
-        y = int(round(event.y / self.scale - MARGIN))
+        x = int(round(self.canvas.canvasx(event.x) / self.scale - MARGIN))
+        y = int(round(self.canvas.canvasy(event.y) / self.scale - MARGIN))
         return max(0, min(x, raw_w - 1)), max(0, min(y, raw_h - 1))
 
     def _ai_adjust_candidate(self, raw: tuple, jump: bool) -> None:

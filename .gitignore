@@ -28,3 +28,13 @@ runner/runs/
 
 # 本地冒烟测试脚本
 _smoke_test.py
+
+# 参考快照(Midscene.js 源码,仅本地参考,不入库)
+midscene_bak/
+# 执行模式批量运行产物(运行期数据)
+runner/result/
+# 调试用截图与网格图
+runner/image2*
+.dbg/
+# 杂项目录(外部导入的临时文件)
+2953028817/

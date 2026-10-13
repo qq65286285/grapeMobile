@@ -1,3 +1,0 @@
-files: [a.yaml, b.yaml]
-concurrent: 2
-retry: 1

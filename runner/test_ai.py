@@ -13,10 +13,11 @@ _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 sys.path.insert(0, _SRC_DIR)
 
 from aiclient import AIClient, AIError
+from locate.config import load_config
 
 
 def main():
-    ai = AIClient()
+    ai = AIClient.from_config(load_config())
     img_arg = sys.argv[1] if len(sys.argv) > 1 else None
 
     if img_arg:

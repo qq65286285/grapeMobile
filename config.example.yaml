@@ -1,6 +1,54 @@
-# imgloc 配置文件示例
-# 用法: Locator(strategy="auto", config="config.example.yaml")
-# 只需覆盖你关心的字段，未列出的字段会自动使用内置默认值（见 src/imgloc/config.py）
+# GrapeMobile 配置文件示例
+# 用法: 复制为 config.yaml 并填入真实值;load_config() 默认读取项目根的 config.yaml
+# 只需覆盖你关心的字段，未列出的字段会自动使用内置默认值
+
+# ---- AI 客户端(OpenAI 兼容接口) ----
+ai:
+  base_url: "https://apihub.agnes-ai.com/v1"
+  api_key: "sk-your-api-key-here"
+  model: "agnes-3.0-flash"
+  timeout: 120
+  max_tokens: 2048
+
+# ---- 定位管线 ----
+locate:
+  mode: full                # full | ocr_only | vlm_only
+  vlm:
+    provider: openai_compat
+    base_url: "https://apihub.agnes-ai.com/v1"
+    api_key: "sk-your-api-key-here"
+    model: "agnes-3.0-flash"
+    fallback_model: ""
+    samples: 3
+    temperature: 0.4
+    coord_format: norm1000_xyxy
+    max_side: 1568
+    timeout: 120
+  ocr:
+    engine: rapidocr
+    fuzzy_threshold: 0.8
+    icon_search_ratio: 3.5
+  verify:
+    enabled: true
+    crop_expand: 0.2
+    min_size: 256
+    top_k: 3
+  fusion:
+    weights:
+      template: 0.5
+      ocr_exact: 0.35
+      ocr_fuzzy: 0.2
+      vlm_consistent: 0.3
+      multi_source: 0.15
+  debug:
+    save_images: true
+    dir: runner/tmp/locate_debug
+
+# ---- 网格 ----
+grid:
+  cell_size: 30
+
+# ---- imgloc 图像匹配库(可选,仅使用 imgloc 时需要) ----
 
 router:
   # 责任链尝试顺序，可自由增删/调整。例如不想用形状匹配和深度学习层，可写：

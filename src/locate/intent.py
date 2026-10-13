@@ -45,6 +45,17 @@ _INPUT_BEFORE_TARGET_RE = re.compile(
     r"(?:到|在|向)\s*[\"“”‘’']?\s*(?P<target>.+?)\s*[\"“”‘’']?\s*$")
 
 
+# 句型 A2: [在] <目标>?<字段词> [里/中/内] [：] 输入 [：] <文本>
+# 例:"在框里输入:65286285@qq.com" / "在邮箱框里填写 abc" / "搜索框 键入 xyz"
+# 此前这类句型漏配(全角冒号/字段词打断正则),落到 LLM 意图后被整句回显,
+# 导致 adb text 收到"框里输入: 65286285@qq.com"这类污染文本
+_INPUT_FIELD_RE = re.compile(
+    r"(?:在|到|向)?\s*[\"“”‘’']?\s*(?P<target>[A-Za-z0-9\u4e00-\u9fa5]{0,10}?)?"
+    r"(?P<field>输入框|搜索框|编辑框|文本框|密码框|验证码框|输入栏|搜索栏|地址栏|回复框|评论框|框|栏|域)"
+    r"(?:中|里|内|边|头)?\s*[:：,，]?\s*(?:输入|填写|键入|录入)\s*[:：,，]?\s*"
+    r"[\"“”‘’']?\s*(?P<text>.+?)\s*[\"“”‘’']?\s*$")
+
+
 def _parse_input_action(query: str):
     """
     检测"输入文字"意图并拆出 (目标框描述, 待输入文本)。
@@ -54,14 +65,29 @@ def _parse_input_action(query: str):
     """
     if not query or not _INPUT_INTENT_RE.search(query):
         return None
-    for pattern in (_INPUT_AFTER_TARGET_RE, _INPUT_BEFORE_TARGET_RE):
+    for pattern in (_INPUT_FIELD_RE, _INPUT_AFTER_TARGET_RE, _INPUT_BEFORE_TARGET_RE):
         m = pattern.search(query)
         if not m:
             continue
-        target = m.group("target").strip().strip("\"“”‘’' ")
-        text = m.group("text").strip().strip("\"“”‘’' ")
-        # 目标需含中文或字母(避免把纯标点当目标);文本非空
-        if target and text and re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", target):
+        if m.groupdict().get("field"):
+            # 字段词句型:"在邮箱框里输入:x" → 目标=邮箱,文本=x
+            target = (m.group("target") or m.group("field")).strip()
+            # 句首动词/介词可能被一并抓进目标("点击搜索框"),剥掉常见前缀
+            target = re.sub(
+                r"^(?:帮我|请|我要|给我|我想|点击|点一下|找|找到|选择|打开|进入|在|到|向|的)+",
+                "", target).strip() or m.group("field")
+        else:
+            target = m.group("target").strip()
+        text = m.group("text").strip()
+        # 剥掉方位性后缀("的地方/里/中/内"等),否则"在 ma xac minh 的地方 输入 810051"
+        # 会把"ma xac minh 的地方"整体当定位目标,污染 OCR/VLM 匹配
+        target = re.sub(r"(?:的?地方|里面|里头|里边|中|里|内)$", "", target).strip()
+        # 目标/文本剥引号与全半角冒号、逗号("输入:xxx"的冒号是分隔符不是内容)
+        target = target.strip("\"“”‘’'：:，,、 ")
+        text = text.strip("\"“”‘’'：:，,、 ")
+        # 目标需含中文或字母(避免把纯标点当目标);文本需含字母/数字/中文(纯标点不是内容)
+        if target and text and re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", target) \
+                and re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", text):
             return target, text
     return None
 
