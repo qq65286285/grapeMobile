@@ -83,7 +83,7 @@ GrapeMobile 是基于 adb 的 **Android UI 自动化「录制 / 编排 / 回放�
 | CR-05 | P1 | 异常被静默吞掉,配置写错无提示 | DONE |
 | CR-06 | P1 | 包结构混乱,12 处以上 `sys.path.insert`;README/依赖与实际不符 | TODO |
 | CR-07 | P2 | 仓库卫生:大文件入库、杂项目录、无 CI、无 LICENSE | DONE |
-| CR-08 | P2 | `gui_steps.py` 3472 行上帝类需拆分 | TODO |
+| CR-08 | P2 | `gui_steps.py` 3472 行上帝类需拆分 | DONE |
 
 ---
 
@@ -214,6 +214,20 @@ GrapeMobile 是基于 adb 的 **Android UI 自动化「录制 / 编排 / 回放�
 
 **验收**:单文件不超过约 800 行;GUI 手测三个 Tab 功能不回归。
 
+**修复记录(2026-10-13,DONE)**
+- 前置:CR-03 卡顿修复经用户确认关单(2026-10-13);先补 `tests/test_gui_smoke.py`(38 例:mixin 方法归属/常量 identity/MRO/行数守卫/真实 Tk 控件渲染,无 display 自动 skip),再动结构。
+- 拆分结果(原 3424 行 → gui_steps.py 508 行):
+  - `ui/theme.py`(THEME + FONT_*)、`ui/constants.py`(路径/布局常量,DEFAULT_CELL_SIZE 读 config);
+  - `ui/widgets.py`(_ChatPane/_UiBridge/_AiLogHandler/_RoundedBadge/_RoundedButton);
+  - `ui/device_dialog.py`(DeviceSelectDialog);
+  - `ui/canvas_mixin.py`(设备画面/网格/画布/锚点/标准图预览,约 600 行);
+  - `ui/steps_mixin.py`(步骤编排/列表/保存加载,约 760 行)+ `ui/steps_cards.py`(二次拆分:双栏卡片渲染与选中高亮,约 220 行);
+  - `ui/runner_mixin.py`(运行/执行模式)、`ui/ai_mixin.py`(AI 定位/候选/叠加)。
+  - `_build_ui` 拆为 `_build_left_panel`/`_build_center_panel`/`_build_normal_tab`/`_build_ai_tab`/`_build_exec_tab`,主体只留三栏骨架+appbar。
+  - gui_steps.py re-export 原符号(THEME/FONT_*/GRID_IMAGE/_UiBridge/DeviceSelectDialog 等),`_ui_preview.py` 等调用方零改动兼容。
+- 验证:pytest 222 passed(184 基线 + 38 冒烟);`_ui_preview.py` 修复过时的 `notebook.select`(自定义 Tab 条后遗留,拆分前已坏);三场景(normal/ai/exec)构建级验收通过(截图不可用——当前会话 ImageGrab 抓屏失败,改用控件树断言:三栏/三 Tab/双栏卡片/用例树/候选卡片/详情展开)。
+- 偏差:拆分中修掉一个自身引入的回归(`root = tk.Frame(self, padding=0)` 应为 `ttk.Frame`,已由构建验收当场捕获修复);`_ui_preview.py` 与测试需 `update_idletasks()` 后 `winfo_ismapped()` 才刷新(Tk 布局语义,非缺陷)。
+
 ## 5. 建议修复顺序
 
 `CR-01 -> CR-02 -> CR-05 -> CR-04 -> CR-03 -> CR-06 -> CR-07 -> CR-08`
@@ -228,3 +242,4 @@ GrapeMobile 是基于 adb 的 **Android UI 自动化「录制 / 编排 / 回放�
 | 2026-10-10 | CR-01/02/03/05 DONE。CR-03: 删除全部 24 处 `_dbg_post` 插桩及 `.dbg/`、debug 文档(此前多轮 LRU 缓存/卡片不重建优化即为修复本体,待用户实测确认 20 次切换)。CR-01: 新建 `config.yaml`(ai/locate/grid),`AIClient` 删硬编码 key、新增 `from_config()`,缺 key 报明确错误;`load_config()` 无参默认读项目根 config.yaml,vlm/ai key 互通。CR-02: `grid.cell_size` 单一来源,`GridMarker`/pipeline/GUI/main 全部改读配置。CR-05: config 解析失败抛 `ConfigError` 含文件路径;`_emit_trace`/`_encode_image` 静默 except 改 warning 日志。全量 184 测试通过。CR-04/06/07/08 仍 TODO。 |
 | 2026-10-10 | CR-01 补充:config.yaml 预留 heal 段(mode/crop_size/search_margin/threshold/ai_verify),详见 ROADMAP.md RM-11。 |
 | 2026-10-13 | CR-04/CR-07 DONE。CR-04:adbtools 新增 `read_device_id()` 与 `AdbClient.command_str()`,main.py/grid.py 删除重复的 `_read_device_id`/`_adb_prefix`,删 `runner/main_old.py`;偏差:`executor.py`/`service.py` 有引用未删(capture.py、locate/template.py),grid.py 的 CELL_SIZE 改读 config。CR-07:midscene_bak/(2547 文件)/runner/result/image2* 出库(暂存区 -2568 文件),.gitignore 补 5 条,新增 CI(pytest)与 MIT LICENSE。验证:py_compile、导入冒烟、CLI 空跑、pytest 184 passed、验收 grep 全过。 |
+| 2026-10-13 | CR-08 DONE。gui_steps.py 3424 行拆为 508 行主体 + `runner/ui/` 包(theme/constants/widgets/device_dialog/canvas_mixin/steps_mixin/steps_cards/runner_mixin/ai_mixin),StepApp 以五个 mixin 组合,_build_ui 拆为五个 _build_*;新增 `tests/test_gui_smoke.py`(38 例:方法归属/常量 identity/MRO/行数守卫/Tk 渲染);`_ui_preview.py` 修复过时 `notebook.select`。验证:pytest 222 passed;三场景构建级验收通过。 |

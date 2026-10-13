@@ -91,7 +91,7 @@ def _load_preview_steps(self) -> None:
 
 def _shoot(out_png: str, tab: int, fill_ai: bool) -> None:
     app = G.StepApp()
-    app.notebook.select(tab)
+    app._switch_tab(tab)  # 自定义 Tab 条(已无 ttk.Notebook),idx 与场景参数一致
     if fill_ai:
         app._ai_chat_append("系统", "输入想做的操作(如「点击 kof 图标」),\n"
                                      "定位后确认即可存入脚本步骤。")

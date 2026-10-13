@@ -102,14 +102,24 @@ GrapeMobile/
 │   ├── grid.py / cvio.py     #   网格换算 / 中文路径图像读写
 │   └── executor.py service.py#   旧链路(仍被 capture.py / locate/template.py 引用)
 ├── runner/                   # 应用层
-│   ├── gui_steps.py          #   主 GUI(Tkinter 三 Tab:普通/AI/执行模式),入口
+│   ├── gui_steps.py          #   主 GUI 入口(StepApp 三 Tab:普通/AI/执行模式)
+│   ├── ui/                   #   GUI 模块包(CR-08 拆分产物)
+│   │   ├── theme.py          #     暗色主题 THEME + 字体常量(视觉层唯一来源)
+│   │   ├── constants.py      #     路径/布局常量(格子尺寸读 config.yaml)
+│   │   ├── widgets.py        #     _ChatPane/_UiBridge/_AiLogHandler/圆角控件
+│   │   ├── device_dialog.py  #     启动设备选择模态框
+│   │   ├── canvas_mixin.py   #     设备画面/网格/画布交互/锚点截图
+│   │   ├── steps_mixin.py    #     步骤编排/列表/保存加载
+│   │   ├── steps_cards.py    #     双栏步骤卡片渲染与选中高亮
+│   │   ├── runner_mixin.py   #     运行控制与执行模式(测试计划)
+│   │   └── ai_mixin.py       #     AI 定位/候选/画布叠加
 │   ├── _ui_preview.py        #   无设备离屏 UI 预览器(开发用)
 │   ├── capture.py / main.py / grid.py   # 命令行小工具
 │   ├── run_steps.py / replay.py         # 无头执行 / 补渲染
 │   ├── scripts/<用例名>/     #   用例库(JSON + images/ 锚点图)
 │   ├── runs/ result/         #   运行期录制产物 / 批量执行产物(均不入库)
 │   └── tmp/                  #   截图、网格图、调试图(不入库)
-├── tests/                    # pytest,184 个用例
+├── tests/                    # pytest,222 个用例(含 test_gui_smoke.py GUI 冒烟)
 ├── benchmark/ examples/      # 算法对比基准 / imgloc 示例
 ├── docs/                     # CODE_REVIEW(待修问题)、ROADMAP(功能路线)、simd 加速设想
 ├── design/                   # GUI 高保真原型(HTML)
@@ -143,7 +153,7 @@ if result.found:
 ## 测试与基准
 
 ```bash
-pytest tests/ -v        # 184 个用例(引擎 / 网格 / 各 matcher / 步骤 / adb 解析)
+pytest tests/ -v        # 222 个用例(引擎 / 网格 / 各 matcher / 步骤 / adb 解析 / GUI 冒烟)
 python benchmark/run_benchmark.py --output benchmark/results/report.csv
 ```
 
